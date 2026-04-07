@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.codex-handoff/
+tests/
+docs/
+.env.local
+.env.local.example

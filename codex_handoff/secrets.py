@@ -152,10 +152,8 @@ def _windows_protect(secret: str) -> str:
         "$plain = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("
         + json.dumps(encoded)
         + "));"
-        "$bytes = [System.Text.Encoding]::UTF8.GetBytes($plain);"
-        "$protected = [System.Security.Cryptography.ProtectedData]::Protect("
-        "$bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser);"
-        "[Convert]::ToBase64String($protected)"
+        "$secure = ConvertTo-SecureString $plain -AsPlainText -Force;"
+        "ConvertFrom-SecureString $secure"
     )
     return _powershell(script)
 
@@ -163,11 +161,11 @@ def _windows_protect(secret: str) -> str:
 def _windows_unprotect(path: Path) -> str:
     encoded = path.read_text(encoding="utf-8").strip()
     script = (
-        "$protected = [Convert]::FromBase64String("
+        "$secure = ConvertTo-SecureString "
         + json.dumps(encoded)
-        + ");"
-        "$bytes = [System.Security.Cryptography.ProtectedData]::Unprotect("
-        "$protected, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser);"
-        "[System.Text.Encoding]::UTF8.GetString($bytes)"
+        + ";"
+        "$ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure);"
+        "try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) } "
+        "finally { if ($ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) } }"
     )
     return _powershell(script)

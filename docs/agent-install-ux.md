@@ -16,6 +16,7 @@ The first remote provider is:
 The user should experience `codex-handoff` as:
 
 - one remote account
+- one remote backend profile only
 - one local background agent per machine
 - one explicit attached repository per workspace the user wants to hand off
 - automatic sync of repo-related Codex thread bundles plus the matching `.codex-handoff/` view
@@ -27,7 +28,7 @@ The key product terms are:
 - `remote`: the synchronized backend, first implemented by Cloudflare R2
 - `agent`: the local background sync process installed on each machine
 - `repo`: the user-facing attachment unit
-- `thread bundle`: the actual sync unit for one Codex thread
+- `thread bundle`: the sync unit for one Codex thread, containing raw source, normalized metadata, and derived handoff artifacts
 - `attach`: opt a repository into handoff sync and connect it to local thread discovery
 - `resume`: reconstruct Codex context from synced memory files
 
@@ -39,9 +40,10 @@ Each attached repo should include:
 - `.codex-handoff/` under that repository
 - the local Codex thread list and session index, used only for discovery
 - the original Codex session jsonl files for threads whose `cwd` matches the repo
+- the normalized metadata required to recreate local `session_index` and SQLite thread visibility on another machine
 - a remote prefix such as `repos/<repo-slug>/` inside the authenticated R2 bucket
 
-The product should not behave like a generic filesystem sync tool. It should sync only the handoff artifacts required to resume Codex work on another machine.
+The product should not behave like a generic filesystem sync tool. It should sync only the Codex source files and handoff artifacts required to resume work on another machine.
 
 ## Desired user journey
 
@@ -53,7 +55,7 @@ The product should not behave like a generic filesystem sync tool. It should syn
 4. Codex attaches the current repository.
 5. Codex reads the local thread list and session index to discover repo-related threads.
 6. Codex enables and starts the local sync agent.
-7. The agent exports thread bundles under `.codex-handoff/threads/<thread-id>/` and pushes them to the repo's R2 prefix in the background.
+7. The agent exports thread bundles under `.codex-handoff/threads/<thread-id>/` with both source logs and handoff files, then pushes them to the repo's R2 prefix in the background.
 
 ### Machine 2
 
@@ -63,8 +65,9 @@ The product should not behave like a generic filesystem sync tool. It should syn
 4. Before the user resumes work, the agent pulls the latest remote thread bundles for that repo.
 5. If local unsynced state exists, the agent compares revisions and resolves the serial-handoff case safely before pushing anything back.
 6. The user starts a new Codex session in the synced repo.
-7. `codex-handoff` materializes the selected thread into the root `.codex-handoff/` files.
-8. Codex reads `.codex-handoff/latest.md`, and on demand runs `codex-handoff resume`.
+7. `codex-handoff` restores the selected thread's original source log and normalized metadata into local `~/.codex/` storage so the thread can appear in Codex.
+8. `codex-handoff` materializes the selected thread into the root `.codex-handoff/` files.
+9. Codex reads `.codex-handoff/latest.md`, and on demand runs `codex-handoff resume`.
 
 ## What "agent-first" means here
 
@@ -109,6 +112,7 @@ These commands are the recommended external UX for the future agent package.
 - `codex-handoff install`
 - `codex-handoff uninstall`
 - `codex-handoff doctor`
+- `codex-handoff skill install`
 - `codex-handoff agent start`
 - `codex-handoff agent stop`
 - `codex-handoff agent status`
@@ -126,6 +130,7 @@ These commands are the recommended external UX for the future agent package.
 - `codex-handoff attach --repo <path>`
 - `codex-handoff detach --repo <path>`
 - `codex-handoff repos list`
+- `codex-handoff --repo <path> enable`
 
 ### Threads
 
@@ -143,9 +148,9 @@ These commands are the recommended external UX for the future agent package.
 
 ### Restore
 
-- `codex-handoff status --repo <path>`
-- `codex-handoff resume --repo <path> --goal "<goal>"`
-- `codex-handoff context-pack --repo <path> --goal "<goal>"`
+- `codex-handoff --repo <path> status`
+- `codex-handoff --repo <path> resume --goal "<goal>"`
+- `codex-handoff --repo <path> context-pack --goal "<goal>"`
 
 ## Background agent responsibilities
 
@@ -156,11 +161,14 @@ The local agent should own:
 - watching `.codex-handoff/raw/*.jsonl`
 - scanning the local Codex thread list and session index for repo-related threads
 - reading original session jsonl for discovered threads
+- extracting normalized `session_index` and SQLite thread metadata for those threads
 - exporting thread bundles under `.codex-handoff/threads/<thread-id>/`
-- batching raw jsonl uploads
+- batching source and handoff uploads
 - debounced sync to the repo's R2 prefix
 - local pull on start, attach, login, wake, and periodic health intervals
 - pre-push remote head checks
+- materializing pulled source logs into local `~/.codex/sessions/...`
+- upserting pulled normalized metadata into local `~/.codex/session_index.jsonl` and `~/.codex/state_5.sqlite`
 - materializing the selected thread into the root `.codex-handoff/` files after pull
 - conflict-safe writes using last-modified metadata, revision markers, and local conflict snapshots
 - structured logs for debugging
@@ -182,6 +190,8 @@ The expected policy is:
 - treat `.codex-handoff/raw/*.jsonl` as append-friendly evidence that can be unioned and deduplicated
 - treat `latest.md` and `handoff.json` as handoff snapshots where newer remote state should be respected unless the local machine is clearly ahead
 - keep thread bundles separate by thread id instead of flattening them into one remote root
+- keep source session documents immutable per revision once uploaded
+- rebuild local Codex-visible records from normalized bundle metadata instead of copying local SQLite files as the remote source of truth
 - if both sides changed since the last common revision, create a local conflict snapshot instead of silently overwriting either side
 
 ## OS integration targets
@@ -191,16 +201,16 @@ The expected policy is:
 - install binary or shim
 - store secrets in Keychain
 - register background auto-start with `launchd`
-- store app state under `~/Library/Application Support/codex-handoff/`
-- write logs under `~/Library/Logs/codex-handoff/`
+- store app state under `~/.codex-handoff/`
+- write logs under `~/.codex-handoff/logs/`
 
 ### Windows
 
 - install binary or shim
 - store secrets with DPAPI
 - register auto-start with Task Scheduler or Startup task
-- store app state under `%APPDATA%\\codex-handoff\\`
-- write logs under `%LOCALAPPDATA%\\codex-handoff\\logs\\`
+- store app state under `~/.codex-handoff/`
+- write logs under `~/.codex-handoff/logs/`
 
 ## Agent install contract for Codex
 
@@ -210,12 +220,13 @@ The install prompt that a user pastes into Codex should be intentionally short. 
 2. If missing, install it via the declared package manager command.
 3. Run `codex-handoff doctor`.
 4. Run remote login if no valid profile exists.
-5. Attach the current repo when the user asked for handoff sync.
-6. Scan local threads for that repo.
-7. Pull the latest remote thread bundles before enabling watch mode.
-8. Register background auto-start for the current user.
-9. Start the local agent.
-10. Print a short success summary with repo slug, discovered thread count, remote prefix, and sync health.
+5. If the user asked to "sync" the current repo, align the current state first.
+6. When the repo is not attached, use `install --skip-agent-start --skip-autostart`.
+7. When the repo is already attached, use `sync now`.
+8. When the user is resuming on another machine, use `receive --skip-agent-start --skip-autostart`.
+9. Print a short state-alignment summary with repo slug, discovered thread count, remote prefix, and sync health.
+10. Ask a short follow-up such as `Push 자동화를 켤까요?`
+11. Only after explicit user approval should Codex register background auto-start and start the local agent.
 
 ## Non-goals for v1
 
@@ -234,13 +245,17 @@ Implemented today:
 - `.codex-handoff` bootstrap model
 - `remote login r2`, `remote whoami`, `remote validate`, `remote logout`
 - macOS Keychain and Windows DPAPI credential strategy
+- repo enable/attach metadata and managed `AGENTS.md` block updates
+- local thread discovery plus thread-bundle export/import primitives
+- repo-scoped sync push/pull/now/watch CLI scaffolding
+- detached local `agent start/status/stop/restart` lifecycle around `sync watch`
+- bundled `codex-handoff` skill install support for Codex bootstrap flows
 
 Not yet implemented:
 
 - npm package
-- background sync agent
+- background sync agent registration
 - auto-start registration
-- repo attachment registry
-- local thread discovery
-- thread bundle export and materialized root view switching
-- sync push and pull commands
+- richer remote repo matching prompts and state reconciliation
+- production-grade conflict resolution
+- Codex-driven summarization as the default background flow

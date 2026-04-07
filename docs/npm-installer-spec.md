@@ -12,7 +12,7 @@ The npm layer should make the product feel like:
 - authenticate once on a machine
 - attach the current repository
 - discover that repo's Codex threads
-- sync thread bundles plus the repo-local `.codex-handoff/` view to Cloudflare R2
+- sync thread bundles, including original session source and the repo-local `.codex-handoff/` view, to Cloudflare R2
 - automatically pull the latest thread bundles on the next machine before work resumes
 
 ## Why npm
@@ -30,6 +30,7 @@ An npm package is a reasonable outer installer because:
 - executable name: `codex-handoff`
 - install mode: global install
 - preferred inner runtime: Node wrapper plus the existing Python engine
+- postinstall behavior: copy the bundled `codex-handoff` skill into `~/.codex/skills/codex-handoff`
 
 ## Recommended split
 
@@ -55,7 +56,9 @@ Owns:
 - context pack generation
 - remote auth operations
 - thread bundle export
+- source session sync and normalized metadata export
 - repo-scoped R2 object sync
+- local Codex session/index/sqlite materialization
 - sync conflict handling
 
 ## Proposed install sequence
@@ -68,13 +71,15 @@ codex-handoff install --repo <path>
 The `install` command should internally cover:
 
 1. `doctor`
-2. remote login when needed
-3. current repo attach
-4. thread discovery from the local thread list and session index
-5. initial remote pull for that repo
-6. agent auto-start registration
-7. agent start
-8. final sync health summary
+2. skill install when missing
+3. remote login when needed
+4. current repo attach
+5. thread discovery from the local thread list and session index
+6. initial remote pull for that repo when matching an existing remote
+7. initial push when creating a new remote
+8. agent auto-start registration
+9. agent start
+10. final sync health summary
 
 ## Required installer behaviors
 
@@ -100,11 +105,14 @@ repos/<repo-slug>/
   current-thread.json
   threads/
     <thread-id>/
-      thread.json
+      manifest.json
       latest.md
       handoff.json
       raw/session.jsonl
-      source/rollout.jsonl.gz
+      source/
+        rollout.jsonl.gz
+        index-entry.json
+        thread-record.json
 ```
 
 Where:
@@ -112,7 +120,7 @@ Where:
 - `manifest.json` records repo identity, known machines, revision markers, and sync metadata
 - `thread-index.json` stores discovered thread metadata
 - `current-thread.json` points to the thread to materialize into the root `.codex-handoff/` view
-- each `threads/<thread-id>/` directory stores both the original source session and the summarized handoff data
+- each `threads/<thread-id>/` directory stores the original source session, normalized Codex-local metadata, and the summarized handoff data
 
 ## Service registration targets
 
@@ -142,6 +150,7 @@ The installer should report:
 - whether the remote credentials validated
 - whether the current repo is attached
 - whether an initial pull completed
+- whether source session materialization into local Codex storage completed
 - where logs and config live
 
 The installer should not dump:

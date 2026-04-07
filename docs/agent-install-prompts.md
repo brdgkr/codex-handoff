@@ -1,120 +1,91 @@
-# Agent Install Prompt Pack
+# Agent Prompt Pack
 
-These are ready-to-paste prompt snippets for the future installer-driven experience. They are written for Codex to execute, not for humans to manually follow line by line.
+These are ready-to-paste prompts for Codex when using `codex-handoff`.
 
-They assume the product ships an npm package later. Until then, treat these as product copy and installer UX content, not live commands.
+The key UX rule is:
 
-## 1. Minimal install prompt
+1. First align the current repo state.
+2. Then ask whether to enable push automation.
+3. Start the watcher only after explicit user approval.
 
-Use this when the user wants the shortest possible install request.
+## 1. Sync This Repo
+
+Use this when the user wants the current repo synced but has not explicitly asked for a watcher.
 
 ```text
-codex-handoff를 이 PC에 설치해.
-Cloudflare R2를 remote로 쓰고 싶다.
-현재 저장소를 attach하고, 이 저장소와 관련된 Codex thread들을 찾아서 thread별로 sync해.
-원본 session jsonl도 올리고 thread별 요약(latest.md, handoff.json)도 같이 올려.
-필요한 패키지 설치, 로그인, 초기 pull, 백그라운드 에이전트 등록과 시작까지 끝내고 상태를 요약해.
+이 저장소를 codex-handoff로 동기화해줘.
+
+먼저 상태를 맞춰:
+- repo가 아직 attach 안 되어 있으면 `codex-handoff --repo . install --skip-agent-start --skip-autostart`
+- 이미 attach 되어 있으면 `codex-handoff --repo . sync now`
+- 다른 PC에서 이어받는 맥락이면 `codex-handoff --repo . receive --skip-agent-start --skip-autostart`
+
+상태를 맞춘 뒤에는 결과만 요약하고, watcher는 바로 켜지 말고
+`Push 자동화를 켤까요?`
+라고 먼저 물어봐.
 ```
 
-## 2. Install and attach current repo
+## 2. Sync And Ask About Automation
 
-Use this when the user wants the current repository to start syncing immediately.
+Use this when the user already expects the follow-up prompt.
 
 ```text
-codex-handoff를 설치해.
-Cloudflare R2 remote 인증까지 진행하고,
-이 저장소를 attach하고,
-로컬 thread list와 session index를 읽어서 이 저장소와 관련된 thread들을 찾아.
-각 thread에 대해 원본 session jsonl과 요약된 handoff 파일을 `.codex-handoff/threads/<thread-id>/`로 만들어.
-백그라운드 에이전트를 등록해서 로그인 후 자동 시작되게 해.
-끝나면 repo slug, 발견된 thread 수, remote prefix, health check 결과만 알려줘.
+이 저장소를 codex-handoff로 동기화해줘.
+먼저 현재 상태를 맞추고, 끝나면 `Push 자동화를 켤까요?` 라고 물어봐.
+내가 그렇다고 답하면 그때 `codex-handoff --repo . agent enable`과 `codex-handoff --repo . agent start`를 실행해.
 ```
 
-## 3. New machine restore prompt
+## 3. Enable Push Automation
 
-Use this on a second machine after login is required again.
+Use this only after the repo is already attached and the user explicitly wants the watcher.
 
 ```text
-이 PC에 codex-handoff를 설치하고 같은 Cloudflare R2 remote로 로그인해.
-백그라운드 sync agent를 등록하고 시작해.
-현재 저장소를 attach한 다음 remote 최신 thread bundle들을 먼저 pull해.
-다운받은 thread들을 `.codex-handoff/threads/` 아래에 저장하고,
-현재 이어갈 thread 하나를 루트 `.codex-handoff/`에 materialize해.
-local 변경이 이미 있으면 안전하게 비교해서 conflict snapshot을 남기거나 병합한 뒤 최신 상태로 맞춰.
-끝나면 resume에 바로 쓸 수 있게 현재 sync 상태와 마지막 pull 결과만 짧게 알려줘.
+이 저장소에서 push 자동화를 켜줘.
+`codex-handoff --repo . agent enable`과 `codex-handoff --repo . agent start`를 실행하고,
+watcher와 autostart 상태를 짧게 알려줘.
 ```
 
-## 4. Explicit npm-driven prompt
-
-Use this when the package name is known and the user wants Codex to perform the install.
+## 4. Disable Push Automation
 
 ```text
-아래 방식으로 codex-handoff를 설치해.
-- npm global install이 필요하면 먼저 준비해
-- 예시 설치 명령: `npm install -g @brdg/codex-handoff`
-- 설치 후 `codex-handoff install --repo <current-repo>` 흐름이 되도록 진행해
-- `doctor`, Cloudflare R2 remote login, repo attach, thread scan, initial pull, agent 자동 시작 등록, agent 실행을 순서대로 끝내
-- 현재 repo와 관련된 Codex thread들만 sync하고 전체 세션은 건드리지 마
-실행 결과는 핵심 상태만 요약해.
+이 저장소에서 push 자동화를 꺼줘.
+`codex-handoff --repo . agent stop`과 필요하면 `codex-handoff --repo . agent disable`까지 실행하고,
+남아 있는 watcher가 없는지 확인해줘.
 ```
 
-## 5. Existing install, sync now
+## 5. Receive On Another Machine
 
-Use this when the package is already installed and the user wants to continue on another machine right now.
+Use this when the user is clearly trying to continue from another PC.
 
 ```text
-codex-handoff를 지금 실행해서 현재 repo의 thread들을 최신 상태로 맞춰.
-먼저 remote head를 pull하고, 그 다음 local 변경을 push해.
-내려받은 thread들은 `.codex-handoff/threads/` 아래에 저장하고, 이어갈 thread를 루트 `.codex-handoff/`에 materialize해.
-충돌이 있으면 덮어쓰지 말고 conflict snapshot을 남긴 뒤 결과만 짧게 요약해.
+이 저장소를 다른 PC에서 이어받게 동기화해줘.
+`codex-handoff --repo . receive --skip-agent-start --skip-autostart`로 먼저 상태를 맞추고,
+끝나면 `Push 자동화를 켤까요?` 라고 물어봐.
+내가 동의하면 그때 watcher를 켜.
 ```
 
-## 6. Prompt with safety boundaries
+## 6. First Push For A New Repo
 
-Use this when the user wants Codex to act autonomously but not overreach.
+Use this when the user wants to upload a repo to R2 for the first time.
 
 ```text
-codex-handoff 설치와 초기 설정을 끝까지 진행해.
-Cloudflare R2 remote를 사용하고, 현재 사용자 계정 기준으로만 자동 시작을 등록해.
-다른 디렉터리는 건드리지 말고 현재 저장소와 그 저장소에 연결된 Codex thread들만 다뤄.
-실패하면 중간에 멈추지 말고 가능한 대안을 시도한 뒤 마지막에 문제만 정리해.
+이 저장소를 codex-handoff로 처음 R2에 올려줘.
+`codex-handoff --repo . install --skip-agent-start --skip-autostart`로 먼저 상태를 맞추고,
+같은 repo slug가 R2에 없으면 first push를 해.
+끝나면 repo slug, remote prefix, sync action을 요약하고
+`Push 자동화를 켤까요?`
+라고 물어봐.
 ```
 
-## Expected install summary format
+## Expected Summary Shape
 
-After the agent completes setup, the final user-facing report should be short and operator-friendly.
-
-Recommended summary shape:
+After the one-shot sync step, the report should stay short:
 
 ```text
-설치 완료
-- package: installed
-- remote: logged in as <profile>
+동기화 완료
 - repo: <repo-slug>
-- threads_discovered: <count>
+- action: <push|pull>
 - remote_prefix: repos/<repo-slug>/
-- agent: running
-- autostart: enabled
-- attached: yes
-- initial_pull: completed
-- sync: healthy
+- watcher: not started
+- next: push 자동화 여부 확인 대기
 ```
-
-## Npm copy guidance
-
-When the npm package exists, keep the product copy short and repeatable:
-
-- package name: `@brdg/codex-handoff`
-- install verb: `npm install -g @brdg/codex-handoff`
-- bootstrap verb: `codex-handoff install --repo <path>`
-- verify verb: `codex-handoff doctor`
-- remote auth verb: `codex-handoff remote login r2`
-- background service verb: `codex-handoff agent start`
-- thread scan verb: `codex-handoff threads scan --repo <path>`
-
-Avoid copy that says:
-
-- "install the certificate"
-- "read all transcripts into memory"
-- "sync every folder automatically"
-- "sync every Codex session on this machine"

@@ -41,14 +41,65 @@ def validate_r2_credentials(profile: R2Profile, timeout: int = 15) -> Dict[str, 
     }
 
 
+def put_r2_object(profile: R2Profile, key: str, payload: bytes, timeout: int = 30) -> Dict[str, str]:
+    return signed_r2_request(
+        profile,
+        method="PUT",
+        path=_object_path(profile.bucket, key),
+        payload=payload,
+        timeout=timeout,
+    )
+
+
+def get_r2_object(profile: R2Profile, key: str, timeout: int = 30) -> bytes:
+    response = signed_r2_request(
+        profile,
+        method="GET",
+        path=_object_path(profile.bucket, key),
+        timeout=timeout,
+    )
+    return response["body_bytes"]
+
+
+def delete_r2_object(profile: R2Profile, key: str, timeout: int = 30) -> Dict[str, str]:
+    return signed_r2_request(
+        profile,
+        method="DELETE",
+        path=_object_path(profile.bucket, key),
+        timeout=timeout,
+    )
+
+
+def list_r2_objects(profile: R2Profile, prefix: str = "", timeout: int = 30) -> list[dict[str, str]]:
+    continuation_token = None
+    results: list[dict[str, str]] = []
+    while True:
+        query = {"list-type": "2", "prefix": prefix}
+        if continuation_token:
+            query["continuation-token"] = continuation_token
+        response = signed_r2_request(
+            profile,
+            method="GET",
+            path="/" + urllib.parse.quote(profile.bucket, safe="-_.~/"),
+            query=query,
+            timeout=timeout,
+        )
+        payload = _parse_list_objects(response["body"])
+        results.extend(payload["objects"])
+        continuation_token = payload["next_token"]
+        if not continuation_token:
+            return results
+
+
 def signed_r2_request(
     profile: R2Profile,
     method: str,
     path: str,
     query: Optional[Dict[str, str]] = None,
     payload: bytes = b"",
+    extra_headers: Optional[Dict[str, str]] = None,
     timeout: int = 15,
-) -> Dict[str, str]:
+) -> Dict[str, object]:
     parsed = urllib.parse.urlparse(profile.endpoint)
     if not parsed.scheme or not parsed.netloc:
         raise R2Error(f"Invalid endpoint: {profile.endpoint}")
@@ -65,6 +116,8 @@ def signed_r2_request(
         "x-amz-content-sha256": payload_hash,
         "x-amz-date": amz_date,
     }
+    if extra_headers:
+        headers.update({key.lower(): value for key, value in extra_headers.items()})
 
     canonical_headers = "".join(f"{key}:{headers[key]}\n" for key in sorted(headers))
     signed_headers = ";".join(sorted(headers))
@@ -114,13 +167,20 @@ def signed_r2_request(
     request = urllib.request.Request(url=url, data=payload or None, method=method.upper(), headers=request_headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8", errors="replace")
-            return {"status": str(response.status), "body": body, "url": url}
+            body_bytes = response.read()
+            body = body_bytes.decode("utf-8", errors="replace")
+            return {"status": str(response.status), "body": body, "body_bytes": body_bytes, "url": url}
     except urllib.error.HTTPError as error:
         body = error.read().decode("utf-8", errors="replace")
         raise R2Error(_format_r2_error(error.code, body)) from error
     except urllib.error.URLError as error:
         raise R2Error(f"Failed to reach R2 endpoint: {error.reason}") from error
+
+
+def _object_path(bucket: str, key: str) -> str:
+    quoted_bucket = urllib.parse.quote(bucket, safe="-_.~/")
+    quoted_key = urllib.parse.quote(key.lstrip("/"), safe="/-_.~")
+    return f"/{quoted_bucket}/{quoted_key}"
 
 
 def _canonical_uri(path: str) -> str:
@@ -168,3 +228,25 @@ def _extract_xml_error(body: str) -> Tuple[Optional[str], Optional[str]]:
     code = root.findtext(".//Code")
     message = root.findtext(".//Message")
     return code, message
+
+
+def _parse_list_objects(body: str) -> dict[str, object]:
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return {"objects": [], "next_token": None}
+    namespace = ""
+    if root.tag.startswith("{"):
+        namespace = root.tag.split("}", 1)[0] + "}"
+    objects = []
+    for content in root.findall(f".//{namespace}Contents"):
+        objects.append(
+            {
+                "key": content.findtext(f"{namespace}Key", default=""),
+                "etag": content.findtext(f"{namespace}ETag", default=""),
+                "last_modified": content.findtext(f"{namespace}LastModified", default=""),
+                "size": content.findtext(f"{namespace}Size", default="0"),
+            }
+        )
+    next_token = root.findtext(f".//{namespace}NextContinuationToken")
+    return {"objects": objects, "next_token": next_token}

@@ -1,0 +1,23 @@
+{
+  "name": "@brdg/codex-handoff",
+  "version": "0.1.0",
+  "description": "Project handoff and cross-machine resume workflow for Codex.",
+  "license": "MIT",
+  "bin": {
+    "codex-handoff": "./npm/bin/codex-handoff.js"
+  },
+  "scripts": {
+    "postinstall": "node ./npm/postinstall.js"
+  },
+  "files": [
+    "codex_handoff/*.py",
+    "skills/codex-handoff/**",
+    "README.md",
+    "AGENTS.md",
+    "pyproject.toml",
+    "npm/**"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

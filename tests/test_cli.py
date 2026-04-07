@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from codex_handoff import cli
 from codex_handoff.config import config_path
+from codex_handoff.local_codex import codex_paths, inject_thread
 
 
 FIXTURE_LATEST = """# Current State
@@ -34,10 +35,10 @@ FIXTURE_HANDOFF = {
             "id": "todo-1",
             "summary": "Verify search output.",
             "status": "pending",
-            "priority": "high"
+            "priority": "high",
         }
     ],
-    "recent_commands": [{"command": "python3 -m codex_handoff status --repo .", "purpose": "sanity check"}]
+    "recent_commands": [{"command": "codex-handoff --repo . status", "purpose": "sanity check"}],
 }
 
 
@@ -47,15 +48,15 @@ FIXTURE_RAW = [
         "turn_id": "turn-1",
         "timestamp": "2026-04-07T00:00:01+09:00",
         "role": "assistant",
-        "message": "reader CLI should build a restore pack from scene-evidence notes"
+        "message": "reader CLI should build a restore pack from scene-evidence notes",
     },
     {
         "session_id": "sess-1",
         "turn_id": "turn-2",
         "timestamp": "2026-04-07T00:00:02+09:00",
         "role": "assistant",
-        "message": "unrelated output"
-    }
+        "message": "unrelated output",
+    },
 ]
 
 
@@ -102,7 +103,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("turn=turn-1", output)
 
     def test_resume_renders_restore_pack(self) -> None:
-        output = self.run_cli("resume", "--goal", "scene-evidence 이어서")
+        output = self.run_cli("resume", "--goal", "scene-evidence restore context")
         self.assertIn("# Codex Restore Pack", output)
         self.assertIn("Validate restore output.", output)
         self.assertIn("Verify search output.", output)
@@ -113,6 +114,148 @@ class CliTests(unittest.TestCase):
         payload = json.loads(output)
         self.assertEqual(len(payload), 1)
         self.assertEqual(payload[0]["turn_id"], "turn-1")
+
+    def test_threads_cleanup_removes_local_codex_thread(self) -> None:
+        codex_home = self.repo / ".codex-home"
+        result = inject_thread(
+            codex_paths(str(codex_home)),
+            title="Cleanup Thread",
+            thread_name="Cleanup Thread",
+            user_message="Please clean me up.",
+            assistant_message="Cleanup ready.",
+            cwd=str(self.repo),
+            thread_id="cleanup-thread-001",
+            apply=True,
+        )
+        self.assertTrue(result.rollout_path.exists())
+
+        output = self.run_cli(
+            "threads",
+            "cleanup",
+            "--thread",
+            "cleanup-thread-001",
+            "--codex-home",
+            str(codex_home),
+            "--apply",
+        )
+        payload = json.loads(output)
+        self.assertEqual(payload["thread_id"], "cleanup-thread-001")
+        self.assertTrue(payload["cleanup_result"]["applied"])
+        self.assertFalse(result.rollout_path.exists())
+        self.assertEqual((codex_home / "session_index.jsonl").read_text(encoding="utf-8"), "")
+
+    def test_sync_now_reports_sync_health_without_extra_file_inspection(self) -> None:
+        codex_home = self.repo / ".codex-home"
+        inject_thread(
+            codex_paths(str(codex_home)),
+            title="CLI Sync Thread",
+            thread_name="CLI Sync Thread",
+            user_message="Run sync now.",
+            assistant_message="Sync now should report health.",
+            cwd=str(self.repo),
+            thread_id="cli-sync-thread-001",
+            apply=True,
+        )
+        memory_dir = self.repo / ".codex-handoff"
+        (memory_dir / "repo.json").write_text(
+            json.dumps(
+                {
+                    "repo_path": str(self.repo),
+                    "repo_slug": "fixture-remote",
+                    "remote_profile": "default",
+                    "remote_prefix": "repos/fixture-remote/",
+                    "summary_mode": "heuristic",
+                    "include_raw_threads": True,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        uploaded_payloads: dict[str, bytes] = {}
+
+        def fake_put(_profile, key, payload, timeout=30):
+            uploaded_payloads[key] = payload
+            return {"status": "200", "url": key}
+
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), patch(
+            "codex_handoff.cli._load_remote_profile",
+            return_value=("default", {"provider": "cloudflare-r2"}),
+        ), patch(
+            "codex_handoff.cli._build_r2_profile",
+            return_value=object(),
+        ), patch(
+            "codex_handoff.sync.put_r2_object",
+            side_effect=fake_put,
+        ):
+            exit_code = cli.main(
+                [
+                    "--repo",
+                    str(self.repo),
+                    "sync",
+                    "now",
+                    "--codex-home",
+                    str(codex_home),
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["repo_slug"], "fixture-remote")
+        self.assertEqual(payload["remote_prefix"], "repos/fixture-remote/")
+        self.assertEqual(payload["thread_count"], 1)
+        self.assertEqual(payload["current_thread"], "cli-sync-thread-001")
+        self.assertEqual(payload["sync_health"]["status"], "ok")
+        self.assertEqual(payload["sync_state"]["last_sync_direction"], "push")
+        self.assertEqual(payload["sync_state"]["last_push"]["objects_uploaded"], len(uploaded_payloads))
+        self.assertEqual(Path(payload["sync_state_path"]).name, "sync-state.json")
+
+    def test_sync_watch_forces_heuristic_summary_mode_on_windows(self) -> None:
+        memory_dir = self.repo / ".codex-handoff"
+        (memory_dir / "repo.json").write_text(
+            json.dumps(
+                {
+                    "repo_path": str(self.repo),
+                    "repo_slug": "fixture-remote",
+                    "remote_profile": "default",
+                    "remote_prefix": "repos/fixture-remote/",
+                    "summary_mode": "auto",
+                    "include_raw_threads": True,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        captured: dict[str, object] = {}
+
+        def fake_watch_and_sync(*args, **kwargs):
+            captured.update(kwargs)
+
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), patch(
+            "codex_handoff.cli._load_remote_profile",
+            return_value=("default", {"provider": "cloudflare-r2"}),
+        ), patch(
+            "codex_handoff.cli._build_r2_profile",
+            return_value=object(),
+        ), patch(
+            "codex_handoff.cli.watch_and_sync",
+            side_effect=fake_watch_and_sync,
+        ):
+            exit_code = cli.main(
+                [
+                    "--repo",
+                    str(self.repo),
+                    "sync",
+                    "watch",
+                    "--no-initial-sync",
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured["summary_mode"], "heuristic")
 
 
 class RemoteCliTests(unittest.TestCase):
@@ -178,9 +321,9 @@ class RemoteCliTests(unittest.TestCase):
                     "access_key_id": "AKIA123456",
                     "secret_backend": "plaintext-file",
                     "secret_ref": str(Path(self.temp_dir.name) / "secret.txt"),
-                    "validated_at": None
+                    "validated_at": None,
                 }
-            }
+            },
         }
         Path(self.temp_dir.name, "secret.txt").write_text("very-secret", encoding="utf-8")
         config_path().parent.mkdir(parents=True, exist_ok=True)
@@ -202,6 +345,167 @@ class RemoteCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         saved = json.loads(config_path().read_text(encoding="utf-8"))
         self.assertEqual(saved["profiles"], {})
+
+    def test_remote_purge_prefix_dry_run_and_apply(self) -> None:
+        remote_store = {
+            "repos/fixture-remote/repo.json": b"{}",
+            "repos/fixture-remote/latest.md": b"# Current State\n",
+            "repos/other-remote/repo.json": b"{}",
+        }
+
+        def fake_list(_profile, prefix="", timeout=30):
+            return [{"key": key, "size": str(len(value))} for key, value in remote_store.items() if key.startswith(prefix)]
+
+        def fake_delete(_profile, key, timeout=30):
+            remote_store.pop(key, None)
+            return {"status": "204", "url": key}
+
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), patch(
+            "codex_handoff.cli._load_remote_profile",
+            return_value=("default", {"provider": "cloudflare-r2"}),
+        ), patch(
+            "codex_handoff.cli._build_r2_profile",
+            return_value=object(),
+        ), patch(
+            "codex_handoff.cli.status_payload",
+            return_value={"running": False},
+        ), patch(
+            "codex_handoff.cli.list_r2_objects",
+            side_effect=fake_list,
+        ), patch(
+            "codex_handoff.cli.delete_r2_object",
+            side_effect=fake_delete,
+        ):
+            exit_code = cli.main(["remote", "purge-prefix", "--repo-slug", "fixture-remote"])
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["object_count"], 2)
+        self.assertFalse(payload["applied"])
+        self.assertIn("repos/fixture-remote/repo.json", remote_store)
+
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), patch(
+            "codex_handoff.cli._load_remote_profile",
+            return_value=("default", {"provider": "cloudflare-r2"}),
+        ), patch(
+            "codex_handoff.cli._build_r2_profile",
+            return_value=object(),
+        ), patch(
+            "codex_handoff.cli.status_payload",
+            return_value={"running": False},
+        ), patch(
+            "codex_handoff.cli.list_r2_objects",
+            side_effect=fake_list,
+        ), patch(
+            "codex_handoff.cli.delete_r2_object",
+            side_effect=fake_delete,
+        ):
+            exit_code = cli.main(["remote", "purge-prefix", "--repo-slug", "fixture-remote", "--apply"])
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["applied"])
+        self.assertEqual(payload["deleted_keys"], 2)
+        self.assertNotIn("repos/fixture-remote/repo.json", remote_store)
+        self.assertIn("repos/other-remote/repo.json", remote_store)
+
+    def test_remote_purge_prefix_refuses_when_agent_is_running(self) -> None:
+        with patch(
+            "codex_handoff.cli._load_remote_profile",
+            return_value=("default", {"provider": "cloudflare-r2"}),
+        ), patch(
+            "codex_handoff.cli._build_r2_profile",
+            return_value=object(),
+        ), patch(
+            "codex_handoff.cli.status_payload",
+            return_value={"running": True},
+        ):
+            with self.assertRaises(SystemExit) as error:
+                cli.main(["remote", "purge-prefix", "--repo-slug", "fixture-remote", "--apply"])
+        self.assertIn("Stop the running agent", str(error.exception))
+
+    def test_remote_purge_thread_rematerializes_root(self) -> None:
+        remote_store = {
+            "repos/fixture-remote/repo.json": b"{}",
+            "repos/fixture-remote/thread-index.json": json.dumps(
+                [
+                    {"thread_id": "thread-a", "title": "A"},
+                    {"thread_id": "thread-b", "title": "B"},
+                ],
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8"),
+            "repos/fixture-remote/current-thread.json": b'{"thread_id":"thread-a"}\n',
+            "repos/fixture-remote/latest.md": b"# A\n",
+            "repos/fixture-remote/handoff.json": b'{"current_goal":"A"}\n',
+            "repos/fixture-remote/raw/session.jsonl": b'{"message":"A"}\n',
+            "repos/fixture-remote/threads/thread-a/latest.md": b"# A\n",
+            "repos/fixture-remote/threads/thread-a/handoff.json": b'{"current_goal":"A"}\n',
+            "repos/fixture-remote/threads/thread-a/raw/session.jsonl": b'{"message":"A"}\n',
+            "repos/fixture-remote/threads/thread-a/manifest.json": b'{"thread_id":"thread-a"}\n',
+            "repos/fixture-remote/threads/thread-b/latest.md": b"# B\n",
+            "repos/fixture-remote/threads/thread-b/handoff.json": b'{"current_goal":"B"}\n',
+            "repos/fixture-remote/threads/thread-b/raw/session.jsonl": b'{"message":"B"}\n',
+            "repos/fixture-remote/threads/thread-b/manifest.json": b'{"thread_id":"thread-b"}\n',
+        }
+
+        def fake_list(_profile, prefix="", timeout=30):
+            return [{"key": key, "size": str(len(value))} for key, value in remote_store.items() if key.startswith(prefix)]
+
+        def fake_get(_profile, key, timeout=30):
+            return remote_store[key]
+
+        def fake_put(_profile, key, payload, timeout=30):
+            remote_store[key] = payload
+            return {"status": "200", "url": key}
+
+        def fake_delete(_profile, key, timeout=30):
+            remote_store.pop(key, None)
+            return {"status": "204", "url": key}
+
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), patch(
+            "codex_handoff.cli._load_remote_profile",
+            return_value=("default", {"provider": "cloudflare-r2"}),
+        ), patch(
+            "codex_handoff.cli._build_r2_profile",
+            return_value=object(),
+        ), patch(
+            "codex_handoff.cli.status_payload",
+            return_value={"running": False},
+        ), patch(
+            "codex_handoff.cli.list_r2_objects",
+            side_effect=fake_list,
+        ), patch(
+            "codex_handoff.cli.get_r2_object",
+            side_effect=fake_get,
+        ), patch(
+            "codex_handoff.cli.put_r2_object",
+            side_effect=fake_put,
+        ), patch(
+            "codex_handoff.cli.delete_r2_object",
+            side_effect=fake_delete,
+        ):
+            exit_code = cli.main(
+                [
+                    "remote",
+                    "purge-thread",
+                    "--repo-slug",
+                    "fixture-remote",
+                    "--thread",
+                    "thread-a",
+                    "--apply",
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["applied"])
+        self.assertEqual(payload["next_thread_id"], "thread-b")
+        self.assertNotIn("repos/fixture-remote/threads/thread-a/manifest.json", remote_store)
+        self.assertEqual(remote_store["repos/fixture-remote/current-thread.json"], b'{\n  "thread_id": "thread-b"\n}\n')
+        self.assertEqual(remote_store["repos/fixture-remote/latest.md"], b"# B\n")
+        self.assertEqual(remote_store["repos/fixture-remote/handoff.json"], b'{"current_goal":"B"}\n')
+        self.assertEqual(remote_store["repos/fixture-remote/raw/session.jsonl"], b'{"message":"B"}\n')
 
 
 if __name__ == "__main__":

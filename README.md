@@ -1,14 +1,11 @@
-<p align="center">
-  <h1 align="center">codex-handoff</h1>
-  <p align="center">Keep Codex work portable across machines, repos, and sessions.</p>
-</p>
+# codex-handoff
 
-<p align="center">
-  <img alt="node >=18" src="https://img.shields.io/badge/node-%E2%89%A518-2f6f44">
-  <img alt="backend cloudflare r2" src="https://img.shields.io/badge/backend-Cloudflare%20R2-f48120">
-  <img alt="platform macOS windows" src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-4b5563">
-  <img alt="license mit" src="https://img.shields.io/badge/license-MIT-111827">
-</p>
+> Keep Codex work portable across machines, repos, and sessions.
+
+![node >=18](https://img.shields.io/badge/node-%E2%89%A518-2f6f44)
+![backend cloudflare r2](https://img.shields.io/badge/backend-Cloudflare%20R2-f48120)
+![platform macOS windows](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-4b5563)
+![license mit](https://img.shields.io/badge/license-MIT-111827)
 
 `codex-handoff` watches repo-related Codex sessions, builds repo-scoped handoff
 memory under `.codex-handoff/`, and syncs that state to a remote backend so you

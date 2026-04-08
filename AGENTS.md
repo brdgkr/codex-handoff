@@ -41,7 +41,7 @@ Before doing substantive work in this repository:
 - Keep package install behavior and repo setup behavior clearly separated in docs and code.
 - During development before npm publish, verify packaging with:
   `npm pack`
-  `npm install -g ./brdg-codex-handoff-<version>.tgz`
+  `npm install -g ./brdgkr-codex-handoff-<version>.tgz`
 - Keep runtime lifecycle safe during npm install and upgrade:
   package install should stop running agent/watch processes before replacing files
   and restart the agent automatically afterward when needed.

@@ -27,7 +27,7 @@ language.
 Install and start sync for this repo:
 
 ```text
-Install `@brdg/codex-handoff` and start sync for this repository.
+Install `@brdgkr/codex-handoff` and start sync for this repository.
 Do not stop at package installation. Finish the setup so it is ready to run.
 ```
 
@@ -126,7 +126,7 @@ Before publishing to npm, test from a tarball:
 
 ```bash
 npm pack
-npm install -g ./brdg-codex-handoff-0.1.0.tgz
+npm install -g ./brdgkr-codex-handoff-0.1.0.tgz
 codex-handoff setup
 ```
 

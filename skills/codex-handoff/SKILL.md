@@ -35,14 +35,14 @@ If the target repo is not the current working directory, find the target repo pa
 During development before npm publish, use the packed tarball path instead of the registry package name:
 
 - `npm pack`
-- `npm install -g ./brdg-codex-handoff-<version>.tgz`
+- `npm install -g ./brdgkr-codex-handoff-<version>.tgz`
 - `codex-handoff --repo <target-repo> setup`
 
 ## Prompt mapping
 
 Interpret short user prompts like this:
 
-- "Install `@brdg/codex-handoff` and start sync for this repository."
+- "Install `@brdgkr/codex-handoff` and start sync for this repository."
   Install the npm package, then continue immediately into `setup` for the target repo.
 - "Set up codex-handoff sync for this repository."
   Run `setup`.

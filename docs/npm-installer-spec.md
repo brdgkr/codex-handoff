@@ -26,7 +26,7 @@ An npm package is a reasonable outer installer because:
 
 ## Recommended package model
 
-- npm package name: `@brdg/codex-handoff`
+- npm package name: `@brdgkr/codex-handoff`
 - executable name: `codex-handoff`
 - install mode: global install
 - preferred inner runtime: pure Node runtime
@@ -64,7 +64,7 @@ Owns:
 ## Proposed install sequence
 
 ```text
-npm install -g @brdg/codex-handoff
+npm install -g @brdgkr/codex-handoff
 codex-handoff setup --repo <path>
 ```
 
@@ -74,7 +74,7 @@ Before npm publish, use the packed tarball as the development verification path:
 
 ```text
 npm pack
-npm install -g ./brdg-codex-handoff-<version>.tgz
+npm install -g ./brdgkr-codex-handoff-<version>.tgz
 codex-handoff setup --repo <path>
 ```
 

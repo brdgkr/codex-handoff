@@ -11,7 +11,7 @@ CLI flow. The skill is responsible for mapping these prompts to `setup`,
 Use when nothing is installed yet and the user wants Codex to set everything up.
 
 ```text
-Install `@brdg/codex-handoff` and start sync for this repository.
+Install `@brdgkr/codex-handoff` and start sync for this repository.
 Do not stop at package installation. Finish the setup so it is actually ready to run.
 ```
 

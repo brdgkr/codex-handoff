@@ -1,11 +1,25 @@
 {
-  "name": "@brdg/codex-handoff",
+  "name": "@brdgkr/codex-handoff",
   "version": "0.1.0",
   "description": "Project handoff and cross-machine resume workflow for Codex.",
   "license": "MIT",
-  "bin": {
-    "codex-handoff": "./npm/bin/codex-handoff.js"
+  "bin": "./npm/bin/codex-handoff.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/brdgkr/codex-handoff.git"
   },
+  "homepage": "https://github.com/brdgkr/codex-handoff#readme",
+  "bugs": {
+    "url": "https://github.com/brdgkr/codex-handoff/issues"
+  },
+  "keywords": [
+    "codex",
+    "handoff",
+    "sync",
+    "cli",
+    "cloudflare-r2",
+    "developer-tools"
+  ],
   "scripts": {
     "preinstall": "node ./npm/preinstall.js",
     "postinstall": "node ./npm/postinstall.js",

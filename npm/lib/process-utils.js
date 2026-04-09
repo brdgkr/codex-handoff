@@ -77,8 +77,25 @@ function listProcessDetails() {
         "-NoProfile",
         "-Command",
         "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; " +
+          "Add-Type @'\n" +
+          "using System;\n" +
+          "using System.Runtime.InteropServices;\n" +
+          "public static class CodexWindowEnum {\n" +
+          "  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);\n" +
+          "  [DllImport(\"user32.dll\")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);\n" +
+          "  [DllImport(\"user32.dll\")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);\n" +
+          "  [DllImport(\"user32.dll\")] public static extern bool IsWindowVisible(IntPtr hWnd);\n" +
+          "}\n" +
+          "'@; " +
+          "$visiblePids = New-Object 'System.Collections.Generic.HashSet[int]'; " +
+          "$callback = [CodexWindowEnum+EnumWindowsProc]{ param($hWnd, $lParam) " +
+          "$windowProcId = 0; " +
+          "[CodexWindowEnum]::GetWindowThreadProcessId($hWnd, [ref]$windowProcId) | Out-Null; " +
+          "if ($windowProcId -gt 0 -and [CodexWindowEnum]::IsWindowVisible($hWnd)) { [void]$visiblePids.Add([int]$windowProcId) }; " +
+          "return $true }; " +
+          "[CodexWindowEnum]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null; " +
           "$items = Get-CimInstance Win32_Process | Select-Object ProcessId, Name, CommandLine; " +
-          "$items | ConvertTo-Json -Compress",
+          "$items | ForEach-Object { [PSCustomObject]@{ ProcessId = $_.ProcessId; Name = $_.Name; CommandLine = $_.CommandLine; HasVisibleWindow = $visiblePids.Contains([int]$_.ProcessId) } } | ConvertTo-Json -Compress",
       ],
       { encoding: "utf8" },
     );
@@ -93,6 +110,7 @@ function listProcessDetails() {
           pid: Number(item.ProcessId),
           name: path.basename(String(item.Name || "")).toLowerCase(),
           command: String(item.CommandLine || "").trim(),
+          hasVisibleWindow: item.HasVisibleWindow === true,
         }))
         .filter((item) => Number.isInteger(item.pid) && item.pid > 0);
     } catch {
@@ -130,9 +148,18 @@ function findScriptProcessPids(scriptName, { configDir = null } = {}) {
     .map((item) => item.pid);
 }
 
-function detectCodexProcesses(processes = null) {
+function detectCodexProcesses(processes = null, options = {}) {
   const candidates = Array.isArray(processes) ? processes : listProcessDetails();
-  return candidates.filter((item) => isCodexAppProcess(item));
+  const matches = candidates.filter((item) => isCodexAppProcess(item));
+  const shouldRequireVisibleWindow = process.platform === "win32" || options.platform === "win32";
+  if (!shouldRequireVisibleWindow) {
+    return matches;
+  }
+  const matchesWithWindowState = matches.filter((item) => typeof item?.hasVisibleWindow === "boolean");
+  if (!matchesWithWindowState.length) {
+    return matches;
+  }
+  return matchesWithWindowState.filter((item) => item.hasVisibleWindow);
 }
 
 function isCodexProcessName(name) {
@@ -159,9 +186,11 @@ function isCodexAppProcess(processInfo) {
   const windowsCommand = normalizedCommand.replace(/\//g, "\\");
   if (windowsCommand.includes("\\codex.exe")) {
     return (
+      windowsCommand.includes("\\windowsapps\\openai.codex_") &&
       !windowsCommand.includes("app-server") &&
       !windowsCommand.includes("helper") &&
-      !windowsCommand.includes("crashpad")
+      !windowsCommand.includes("crashpad") &&
+      !windowsCommand.includes("--type=")
     );
   }
 

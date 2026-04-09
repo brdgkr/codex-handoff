@@ -72,9 +72,9 @@ This two-step flow is the intended product distribution model. Design install be
 
 Before npm publish, use the packed tarball as the development verification path:
 
-```text
-npm pack
-npm install -g ./brdgkr-codex-handoff-<version>.tgz
+```bash
+TARBALL=$(npm pack --silent)
+npm install -g "./$TARBALL"
 codex-handoff setup --repo <path>
 ```
 

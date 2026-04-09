@@ -125,9 +125,9 @@ If you prefer direct CLI commands instead of prompt-first use, see:
 Before publishing to npm, test from a tarball:
 
 ```bash
-npm pack
-npm install -g ./brdgkr-codex-handoff-0.1.0.tgz
-codex-handoff setup
+TARBALL=$(npm pack --silent)
+npm install -g "./$TARBALL"
+codex-handoff --repo . setup
 ```
 
 Run tests:

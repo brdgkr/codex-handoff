@@ -1,9 +1,11 @@
 {
   "name": "@brdgkr/codex-handoff",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Project handoff and cross-machine resume workflow for Codex.",
   "license": "MIT",
-  "bin": "./npm/bin/codex-handoff.js",
+  "bin": {
+    "codex-handoff": "npm/bin/codex-handoff.js"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/brdgkr/codex-handoff.git"

@@ -80,6 +80,7 @@ While Codex is open:
 ### Local repo files
 
 - `.codex-handoff/repo.json`
+- `.codex-handoff/.env.local`
 - `.codex-handoff/thread-index.json`
 - `.codex-handoff/current-thread.json`
 - `.codex-handoff/sync-state.json`
@@ -95,6 +96,7 @@ While Codex is open:
 ### Global logs
 
 - `~/.codex-handoff/logs/agent-service.log`
+- `~/.codex-handoff/logs/watch-service.log`
 - `~/.codex-handoff/logs/watch-events.log`
 - `~/.codex-handoff/logs/watch-raw-events.log`
 - `~/.codex-handoff/logs/watch-changed-files.log`

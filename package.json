@@ -23,7 +23,7 @@
   "scripts": {
     "preinstall": "node ./npm/preinstall.js",
     "postinstall": "node ./npm/postinstall.js",
-    "test:node": "node --test npm/service/common.test.js npm/service/watch_service.test.js npm/service/agent_controller.test.js npm/lib/process-utils.test.js npm/lib/reader.test.js npm/lib/summarize.test.js npm/lib/sync.test.js npm/lib/workspace.test.js npm/install-lifecycle.test.js npm/cli.test.js"
+    "test:node": "node --test npm/service/common.test.js npm/service/watch_service.test.js npm/service/agent_controller.test.js npm/lib/child-process.test.js npm/lib/process-utils.test.js npm/lib/reader.test.js npm/lib/repo-auth.test.js npm/lib/runtime-config.test.js npm/lib/summarize.test.js npm/lib/sync.test.js npm/lib/workspace.test.js npm/install-lifecycle.test.js npm/cli.test.js"
   },
   "files": [
     "LICENSE",

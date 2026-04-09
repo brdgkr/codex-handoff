@@ -1,12 +1,14 @@
 const { spawnSync } = require("node:child_process");
 const path = require("node:path");
 
+const { withHiddenWindows } = require("./child-process");
+
 function isProcessRunning(pid) {
   if (!Number.isInteger(pid) || pid <= 0) {
     return false;
   }
   if (process.platform === "win32") {
-    const result = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], { encoding: "utf8" });
+    const result = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], withHiddenWindows({ encoding: "utf8" }));
     if (result.status !== 0) {
       return false;
     }
@@ -25,7 +27,7 @@ function terminateProcess(pid) {
     return;
   }
   if (process.platform === "win32") {
-    spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { encoding: "utf8" });
+    spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], withHiddenWindows({ encoding: "utf8" }));
     return;
   }
   spawnSync("kill", ["-TERM", String(pid)], { encoding: "utf8" });
@@ -36,7 +38,7 @@ function forceTerminateProcess(pid) {
     return;
   }
   if (process.platform === "win32") {
-    spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { encoding: "utf8" });
+    spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], withHiddenWindows({ encoding: "utf8" }));
     return;
   }
   spawnSync("kill", ["-KILL", String(pid)], { encoding: "utf8" });
@@ -44,7 +46,7 @@ function forceTerminateProcess(pid) {
 
 function listProcesses() {
   if (process.platform === "win32") {
-    const result = spawnSync("tasklist", ["/FO", "CSV", "/NH"], { encoding: "utf8" });
+    const result = spawnSync("tasklist", ["/FO", "CSV", "/NH"], withHiddenWindows({ encoding: "utf8" }));
     if (result.status !== 0) {
       return [];
     }
@@ -97,7 +99,7 @@ function listProcessDetails() {
           "$items = Get-CimInstance Win32_Process | Select-Object ProcessId, Name, CommandLine; " +
           "$items | ForEach-Object { [PSCustomObject]@{ ProcessId = $_.ProcessId; Name = $_.Name; CommandLine = $_.CommandLine; HasVisibleWindow = $visiblePids.Contains([int]$_.ProcessId) } } | ConvertTo-Json -Compress",
       ],
-      { encoding: "utf8" },
+      withHiddenWindows({ encoding: "utf8" }),
     );
     if (result.status !== 0) {
       return [];

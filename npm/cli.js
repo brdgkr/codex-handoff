@@ -7,7 +7,7 @@ const { serviceState, isRunning, startAgentService, stopAgentService } = require
 const { autostartStatus, disableAutostart, enableAutostart } = require("./lib/autostart");
 const { describeCurrentProject } = require("./lib/codex-projects");
 const { gitOriginUrlFromRepo } = require("./lib/git-config");
-const { cleanupThread, codexPaths, discoverThreadsForRepo } = require("./lib/local-codex");
+const { cleanupThread, codexPaths, discoverThreadsForRepo, gitOriginAliases, normalizeGitOriginUrl } = require("./lib/local-codex");
 const {
   extractRecords,
   renderContextPack,
@@ -18,10 +18,19 @@ const {
   resolveRepoPath,
   searchRaw,
 } = require("./lib/reader");
-const { loadDefaultR2Profile, loadConfig, saveConfig } = require("./lib/runtime-config");
-const { ensureGlobalDotenvTemplate, readClipboardText, readR2CredentialsFromDotenv, readR2CredentialsFromEnv } = require("./lib/remote-auth");
+const { cleanupLegacyAuthArtifacts, loadConfig, saveConfig } = require("./lib/runtime-config");
 const { findScriptProcessPids } = require("./lib/process-utils");
-const { storeSecret, deleteSecret } = require("./lib/secrets");
+const {
+  DEFAULT_REMOTE_AUTH_PATH,
+  DEFAULT_REMOTE_AUTH_TYPE,
+  clearRepoR2Profile,
+  ensureRepoDotenvTemplate,
+  loadRepoR2Profile,
+  readR2CredentialsForSource,
+  repoDotenvPath,
+  repoR2ProfileStatus,
+  saveRepoR2Profile,
+} = require("./lib/repo-auth");
 const { installSkill, installedSkillPath } = require("./lib/skills");
 const {
   describeSyncState,
@@ -102,7 +111,7 @@ function main(argv = process.argv.slice(2)) {
   }
 
   if (args.command === "remote") {
-    return Promise.resolve(handleRemote(args, configDir));
+    return Promise.resolve(handleRemote(args, repoPath, memoryDir, configDir));
   }
 
   if (args.command === "enable") {
@@ -137,49 +146,45 @@ function main(argv = process.argv.slice(2)) {
   return 2;
 }
 
-async function handleRemote(args, configDir) {
-  const payload = loadConfig(configDir);
+async function handleRemote(args, _repoPath, memoryDir, configDir) {
   if (args.subcommand === "whoami") {
-    const profileName = payload.default_profile || "default";
-    const profile = payload.profiles?.[profileName];
-    if (!profile) throw new Error(`Remote profile not found: ${profileName}`);
+    const profile = loadRepoR2Profile(memoryDir);
     printJson({
-      profile: profileName,
-      provider: profile.provider,
+      provider: "cloudflare-r2",
       account_id: profile.account_id,
       bucket: profile.bucket,
       endpoint: profile.endpoint,
       memory_prefix: profile.memory_prefix,
       access_key_id: mask(profile.access_key_id || ""),
-      secret_backend: profile.secret_backend,
-      validated_at: profile.validated_at,
-      config_path: configPath(configDir),
+      auth_type: DEFAULT_REMOTE_AUTH_TYPE,
+      dotenv_path: repoDotenvPath(memoryDir),
     });
     return 0;
   }
   if (args.subcommand === "validate") {
-    const profile = loadDefaultR2Profile(configDir);
+    const profile = loadRepoR2Profile(memoryDir);
     printJson(await validateR2Credentials(profile));
     return 0;
   }
   if (args.subcommand === "logout") {
-    const profileName = payload.default_profile || "default";
-    const profile = payload.profiles?.[profileName];
-    if (profile) deleteSecret(profile.secret_backend, profile.secret_ref, profileName);
-    payload.profiles = {};
-    payload.default_profile = null;
-    saveConfig(configDir, payload);
-    printJson({ removed_profile: profileName, config_path: configPath(configDir) });
+    const dotenvPath = clearRepoR2Profile(memoryDir);
+    cleanupLegacyAuthArtifacts(configDir);
+    saveConfig(configDir, loadConfig(configDir));
+    printJson({ cleared: true, auth_type: DEFAULT_REMOTE_AUTH_TYPE, dotenv_path: dotenvPath });
     return 0;
   }
   if (args.subcommand === "login" && args.remoteProvider === "r2") {
-    printJson(loginDefaultR2Profile(configDir, args));
+    printJson(loginRepoR2Profile(memoryDir, args, configDir));
     return 0;
   }
   if (args.subcommand === "repos") {
-    const profile = loadDefaultR2Profile(configDir);
+    const profile = loadRepoR2Profile(memoryDir);
     const slugs = await listRemoteRepoSlugs(profile);
-    const response = { profile: payload.default_profile || "default", repo_slugs: slugs };
+    const response = {
+      auth_type: DEFAULT_REMOTE_AUTH_TYPE,
+      dotenv_path: repoDotenvPath(memoryDir),
+      repo_slugs: slugs,
+    };
     if (args.detail) {
       response.repos = await Promise.all(slugs.map((slug) => fetchRemoteRepoDetail(profile, slug)));
     }
@@ -187,16 +192,18 @@ async function handleRemote(args, configDir) {
     return 0;
   }
   if (args.subcommand === "purge-prefix") {
-    const profile = loadDefaultR2Profile(configDir);
+    const profile = loadRepoR2Profile(memoryDir);
     const result = await purgeRemotePrefix(profile, args.repoSlug, { apply: Boolean(args.apply) });
-    result.profile = payload.default_profile || "default";
+    result.auth_type = DEFAULT_REMOTE_AUTH_TYPE;
+    result.dotenv_path = repoDotenvPath(memoryDir);
     printJson(result);
     return 0;
   }
   if (args.subcommand === "purge-thread") {
-    const profile = loadDefaultR2Profile(configDir);
+    const profile = loadRepoR2Profile(memoryDir);
     const result = await purgeRemoteThread(profile, args.repoSlug, args.thread, { apply: Boolean(args.apply) });
-    result.profile = payload.default_profile || "default";
+    result.auth_type = DEFAULT_REMOTE_AUTH_TYPE;
+    result.dotenv_path = repoDotenvPath(memoryDir);
     printJson(result);
     return 0;
   }
@@ -216,11 +223,9 @@ function resolveIncludeRawThreads(args, fallback = false) {
 
 async function performEnable(repoPath, memoryDir, configDir, codexHome, args) {
   const config = loadConfig(configDir);
-  const profileName = config.default_profile || "default";
-  if (!config.profiles?.[profileName]) {
-    throw new Error(`Remote profile not found: ${profileName}`);
-  }
-  const profile = loadDefaultR2Profile(configDir);
+  const existingRepoState = loadRepoState(memoryDir);
+  ensureRepoCredentialsForInstall(memoryDir, args, configDir);
+  const profile = loadRepoR2Profile(memoryDir);
   const remoteDetails = await listRemoteRepoDetails(profile);
   const currentProject = describeCurrentProject(repoPath, codexHome);
   const matchResult = resolveRepoSlug(repoPath, memoryDir, args, remoteDetails, currentProject);
@@ -241,7 +246,6 @@ async function performEnable(repoPath, memoryDir, configDir, codexHome, args) {
     config.machine_id = cryptoRandomId();
   }
   const repoState = buildRepoState(repoPath, {
-    profileName,
     machineId: config.machine_id,
     remoteSlug: repoSlug,
     includeRawThreads: resolveIncludeRawThreads(args, false),
@@ -249,6 +253,7 @@ async function performEnable(repoPath, memoryDir, configDir, codexHome, args) {
     matchMode: args.matchMode || "auto",
     matchStatus: matchResult.match_status,
     projectName: currentProject.project_name,
+    previousRepoState: existingRepoState,
   });
   saveRepoState(memoryDir, repoState);
   if (!args.skipSkillInstall) {
@@ -263,7 +268,8 @@ async function performEnable(repoPath, memoryDir, configDir, codexHome, args) {
     repo: repoPath,
     memory_dir: memoryDir,
     repo_slug: repoSlug,
-    remote_profile: profileName,
+    remote_auth_type: repoState.remote_auth_type,
+    remote_auth_path: repoState.remote_auth_path,
     remote_prefix: repoState.remote_prefix,
     summary_mode: repoState.summary_mode,
     include_raw_threads: repoState.include_raw_threads,
@@ -288,7 +294,6 @@ async function handleEnable(repoPath, memoryDir, configDir, codexHome, args) {
 }
 
 async function handleSetup(repoPath, memoryDir, configDir, codexHome, args) {
-  ensureDefaultProfileForInstall(configDir, args);
   const enableResult = await performEnable(repoPath, memoryDir, configDir, codexHome, args);
   if (enableResult.selection_required) {
     printJson({
@@ -305,7 +310,7 @@ async function handleSetup(repoPath, memoryDir, configDir, codexHome, args) {
     return 0;
   }
   const repoState = loadRepoState(memoryDir);
-  const profile = loadDefaultR2Profile(configDir);
+  const profile = loadRepoR2Profile(memoryDir);
   const remoteSlugs = await listRemoteRepoSlugs(profile);
   const remoteExists = remoteSlugs.includes(repoState.repo_slug);
   let syncResult = null;
@@ -389,7 +394,7 @@ async function handleUninstall(repoPath, memoryDir, configDir, _codexHome, _args
     gitignore_entry_removed: gitignoreResult.removed,
     memory_dir: memoryDir,
     memory_dir_preserved: true,
-    remote_profile_preserved: true,
+    credentials_file_preserved: true,
   });
   return 0;
 }
@@ -410,7 +415,7 @@ async function handleReceive(repoPath, memoryDir, configDir, codexHome, args) {
     return 0;
   }
   const repoState = loadRepoState(memoryDir);
-  const profile = loadDefaultR2Profile(configDir);
+  const profile = loadRepoR2Profile(memoryDir);
   const syncResult = await performSyncPull(repoPath, memoryDir, profile, repoState, { codexHome, thread: args.thread || null });
   let autostartResult = null;
   let autostartError = null;
@@ -440,7 +445,7 @@ async function handleReceive(repoPath, memoryDir, configDir, codexHome, args) {
 
 async function handleThreads(args, repoPath, memoryDir, codexHome) {
   if (args.subcommand === "scan") {
-    const threads = discoverThreadsForRepo(repoPath, codexHome);
+    const threads = discoverThreadsForRepo(repoPath, codexHome, loadRepoState(memoryDir));
     printJson({
       repo: repoPath,
       thread_count: threads.length,
@@ -488,12 +493,13 @@ async function handleSync(args, repoPath, memoryDir, configDir, codexHome) {
       repo: repoPath,
       memory_dir: memoryDir,
       repo_slug: repoState.repo_slug,
-      remote_profile: repoState.remote_profile,
+      remote_auth_type: repoState.remote_auth_type,
+      remote_auth_path: repoState.remote_auth_path,
       remote_prefix: repoState.remote_prefix,
     }));
     return 0;
   }
-  const profile = loadDefaultR2Profile(configDir);
+  const profile = loadRepoR2Profile(memoryDir);
   if (args.subcommand === "push") {
     const uploaded = await pushMemoryTree(profile, memoryDir, repoState.remote_prefix);
     recordSyncEvent(memoryDir, {
@@ -506,7 +512,8 @@ async function handleSync(args, repoPath, memoryDir, configDir, codexHome) {
     printJson(augmentSyncResult(memoryDir, repoState, {
       repo: repoPath,
       repo_slug: repoState.repo_slug,
-      remote_profile: repoState.remote_profile,
+      remote_auth_type: repoState.remote_auth_type,
+      remote_auth_path: repoState.remote_auth_path,
       remote_prefix: repoState.remote_prefix,
       prefix: repoState.remote_prefix,
       uploaded_objects: uploaded.length,
@@ -576,7 +583,8 @@ async function handleAgent(args, repoPath, memoryDir, configDir, codexHome) {
       configured: true,
       running: true,
       pid: started.pid,
-      profile: repoState.remote_profile,
+      remote_auth_type: repoState.remote_auth_type || DEFAULT_REMOTE_AUTH_TYPE,
+      remote_auth_path: repoState.remote_auth_path || DEFAULT_REMOTE_AUTH_PATH,
       repo: repoPath,
       interval_seconds: 15,
       summary_mode: "none",
@@ -586,6 +594,7 @@ async function handleAgent(args, repoPath, memoryDir, configDir, codexHome) {
       phase: "idle",
       package_version: PACKAGE_VERSION,
       log_path: path.join(configDir, "logs", "agent-service.log"),
+      watch_service_log_path: path.join(configDir, "logs", "watch-service.log"),
       event_log_path: path.join(configDir, "logs", "watch-events.log"),
       raw_event_log_path: path.join(configDir, "logs", "watch-raw-events.log"),
       changed_files_log_path: path.join(configDir, "logs", "watch-changed-files.log"),
@@ -606,7 +615,8 @@ async function handleAgent(args, repoPath, memoryDir, configDir, codexHome) {
       configured: true,
       running: true,
       pid: started.pid,
-      profile: repoState.remote_profile,
+      remote_auth_type: repoState.remote_auth_type || DEFAULT_REMOTE_AUTH_TYPE,
+      remote_auth_path: repoState.remote_auth_path || DEFAULT_REMOTE_AUTH_PATH,
       repo: repoPath,
       interval_seconds: 15,
       summary_mode: "none",
@@ -616,6 +626,7 @@ async function handleAgent(args, repoPath, memoryDir, configDir, codexHome) {
       phase: "idle",
       package_version: PACKAGE_VERSION,
       log_path: path.join(configDir, "logs", "agent-service.log"),
+      watch_service_log_path: path.join(configDir, "logs", "watch-service.log"),
       event_log_path: path.join(configDir, "logs", "watch-events.log"),
       raw_event_log_path: path.join(configDir, "logs", "watch-raw-events.log"),
       changed_files_log_path: path.join(configDir, "logs", "watch-changed-files.log"),
@@ -634,7 +645,7 @@ async function handleAgent(args, repoPath, memoryDir, configDir, codexHome) {
 
 async function handleSyncNow(repoPath, memoryDir, configDir, codexHome) {
   const repoState = loadRepoState(memoryDir);
-  const profile = loadDefaultR2Profile(configDir);
+  const profile = loadRepoR2Profile(memoryDir);
   const result = await syncNow(repoPath, memoryDir, profile, {
     codexHome,
     includeRawThreads: repoIncludesRawThreads(repoState),
@@ -646,6 +657,7 @@ async function handleSyncNow(repoPath, memoryDir, configDir, codexHome) {
 
 function doctor(repoPath, memoryDir, configDir, codexHome) {
   const repoState = loadRepoState(memoryDir);
+  const authStatus = repoR2ProfileStatus(memoryDir);
   const syncReport = describeSyncState(memoryDir);
   const roots = materializedRootPaths(memoryDir);
   const state = liveServiceState(configDir);
@@ -656,6 +668,7 @@ function doctor(repoPath, memoryDir, configDir, codexHome) {
     codex_home: codexHome,
     config_path: configPath(configDir),
     repo_enabled: Object.keys(repoState).length > 0,
+    remote_auth: authStatus,
     repo_state: repoState,
     sync_state: syncReport.sync_state,
     sync_state_path: syncReport.sync_state_path,
@@ -678,7 +691,8 @@ function statusPayload(repoPath, repoState, state, configDir) {
     configured: Boolean(state),
     running,
     pid: state?.pid || null,
-    profile: repoState.remote_profile,
+    remote_auth_type: repoState.remote_auth_type || DEFAULT_REMOTE_AUTH_TYPE,
+    remote_auth_path: repoState.remote_auth_path || DEFAULT_REMOTE_AUTH_PATH,
     repo: repoPath,
     interval_seconds: state?.poll_interval_ms ? state.poll_interval_ms / 1000 : 2,
     summary_mode: "none",
@@ -691,6 +705,7 @@ function statusPayload(repoPath, repoState, state, configDir) {
     restart_required: restartRequired,
     watcher_running: Boolean(state?.watcher?.pid && running),
     log_path: path.join(configDir, "logs", "agent-service.log"),
+    watch_service_log_path: path.join(configDir, "logs", "watch-service.log"),
     event_log_path: path.join(configDir, "logs", "watch-events.log"),
     raw_event_log_path: path.join(configDir, "logs", "watch-raw-events.log"),
     changed_files_log_path: path.join(configDir, "logs", "watch-changed-files.log"),
@@ -795,7 +810,8 @@ function augmentSyncResult(memoryDir, repoState, payload) {
   const result = { ...payload };
   const syncReport = describeSyncState(memoryDir);
   result.repo_slug = result.repo_slug || repoState.repo_slug;
-  result.remote_profile = result.remote_profile || repoState.remote_profile;
+  result.remote_auth_type = result.remote_auth_type || repoState.remote_auth_type || DEFAULT_REMOTE_AUTH_TYPE;
+  result.remote_auth_path = result.remote_auth_path || repoState.remote_auth_path || DEFAULT_REMOTE_AUTH_PATH;
   result.remote_prefix = result.remote_prefix || repoState.remote_prefix || result.prefix;
   result.prefix = result.prefix || result.remote_prefix;
   if (result.current_thread === undefined || result.current_thread === null) {
@@ -852,11 +868,20 @@ function resolveRepoSlug(repoPath, memoryDir, args, remoteDetails, currentProjec
     return { repo_slug: args.remoteSlug, match_status: "explicit" };
   }
   const existing = loadRepoState(memoryDir);
-  if (existing.repo_slug) {
-    return { repo_slug: String(existing.repo_slug), match_status: "existing_local" };
-  }
   const inferred = inferRepoSlug(repoPath);
   const remoteSlugs = remoteDetails.map((item) => item.repo_slug);
+  const staleExistingSlug = isStaleExistingRepoSlug(repoPath, existing, inferred);
+  if (existing.repo_slug && !staleExistingSlug) {
+    return { repo_slug: String(existing.repo_slug), match_status: "existing_local" };
+  }
+  if (staleExistingSlug) {
+    if (remoteSlugs.includes(inferred)) {
+      return { repo_slug: inferred, match_status: "matched_remote_inferred" };
+    }
+    if (args.matchMode !== "existing") {
+      return { repo_slug: inferred, match_status: "create_new" };
+    }
+  }
   if (args.matchMode === "existing") {
     return resolveExistingRemoteMatch(repoPath, inferred, remoteDetails, currentProject);
   }
@@ -873,6 +898,20 @@ function resolveRepoSlug(repoPath, memoryDir, args, remoteDetails, currentProjec
     }
   }
   return { repo_slug: inferred, match_status: "create_new" };
+}
+
+function isStaleExistingRepoSlug(repoPath, existing, inferredSlug) {
+  const existingSlug = existing?.repo_slug ? String(existing.repo_slug) : null;
+  if (!existingSlug) {
+    return false;
+  }
+  if (String(existing?.match_status || "") === "explicit") {
+    return false;
+  }
+  if (!gitOriginUrlFromRepo(repoPath)) {
+    return false;
+  }
+  return Boolean(inferredSlug) && existingSlug !== inferredSlug;
 }
 
 function resolveExistingRemoteMatch(repoPath, inferredSlug, remoteDetails, currentProject) {
@@ -908,7 +947,7 @@ function bestRemoteCandidate(repoPath, inferredSlug, remoteDetails, currentProje
 
 function rankRemoteCandidates(repoPath, inferredSlug, remoteDetails, currentProject) {
   const repoName = path.basename(repoPath).toLowerCase();
-  const repoOrigin = (getGitOrigin(repoPath) || "").trim().toLowerCase();
+  const repoOrigin = normalizeGitOriginUrl(getGitOrigin(repoPath));
   const projectName = String(currentProject.project_name || path.basename(repoPath)).trim().toLowerCase();
   return remoteDetails
     .map((item) => {
@@ -918,8 +957,11 @@ function rankRemoteCandidates(repoPath, inferredSlug, remoteDetails, currentProj
         score += 100;
         reasons.push("slug");
       }
-      const candidateOrigin = String(item.git_origin_url || "").trim().toLowerCase();
-      if (repoOrigin && candidateOrigin && repoOrigin === candidateOrigin) {
+      const candidateOrigins = gitOriginAliases(
+        item.git_origin_url || null,
+        Array.isArray(item.git_origin_urls) ? item.git_origin_urls : [],
+      );
+      if (repoOrigin && candidateOrigins.some((origin) => normalizeGitOriginUrl(origin) === repoOrigin)) {
         score += 80;
         reasons.push("git_origin");
       }
@@ -1262,56 +1304,40 @@ function cryptoRandomId() {
   return require("node:crypto").randomUUID();
 }
 
-function ensureDefaultProfileForInstall(configDir, args) {
-  const config = loadConfig(configDir);
-  const profileName = config.default_profile || "default";
-  if (config.profiles?.[profileName]) {
-    return { profile_name: profileName, created: false };
-  }
+function ensureRepoCredentialsForInstall(memoryDir, args, configDir) {
   try {
-    return loginDefaultR2Profile(configDir, args);
+    loadRepoR2Profile(memoryDir);
+    return {
+      auth_type: DEFAULT_REMOTE_AUTH_TYPE,
+      dotenv_path: repoDotenvPath(memoryDir),
+      created: false,
+    };
   } catch (error) {
     const source = resolveAuthSource(args);
-    const dotenvPath = source === "dotenv" ? path.resolve(args.dotenv || ensureGlobalDotenvTemplate()) : null;
-    const hint = source === "dotenv"
-      ? `Add your R2 credentials to ${dotenvPath} or run \`codex-handoff remote login r2\` first.`
-      : `Run \`codex-handoff remote login r2\` first or provide credentials via --auth-source ${source}.`;
-    throw new Error(`Remote profile not found: ${profileName}. ${hint} ${error.message}`);
+    if (source === "clipboard" || source === "env" || args.dotenv) {
+      return loginRepoR2Profile(memoryDir, args, configDir);
+    }
+    const dotenvPath = ensureRepoDotenvTemplate(memoryDir);
+    throw new Error(
+      `R2 credentials are required in ${dotenvPath}. Fill in that file or run \`codex-handoff remote login r2 --from-clipboard\` first. ${error.message}`,
+    );
   }
 }
 
-function loginDefaultR2Profile(configDir, args) {
-  const payload = loadConfig(configDir);
-  const profileName = payload.default_profile || "default";
+function loginRepoR2Profile(memoryDir, args, configDir) {
   const source = resolveAuthSource(args);
-  const creds = readR2CredentialsForSource(source, args);
-  assertValidR2Credentials(creds, source, args);
-  const secretInfo = storeSecret(profileName, creds.secret_access_key, configDir);
-  payload.default_profile = profileName;
-  payload.profiles = {
-    ...(payload.profiles || {}),
-    [profileName]: {
-      provider: "cloudflare-r2",
-      account_id: creds.account_id,
-      bucket: creds.bucket,
-      endpoint: creds.endpoint,
-      region: "auto",
-      memory_prefix: "projects/",
-      access_key_id: creds.access_key_id,
-      secret_backend: secretInfo.secret_backend,
-      secret_ref: secretInfo.secret_ref,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-      validated_at: new Date().toISOString(),
-    },
-  };
-  saveConfig(configDir, payload);
+  const creds = readR2CredentialsForSource(source, args, memoryDir);
+  const dotenvPath = saveRepoR2Profile(memoryDir, creds);
+  cleanupLegacyAuthArtifacts(configDir);
+  saveConfig(configDir, loadConfig(configDir));
+  const profile = loadRepoR2Profile(memoryDir);
   return {
-    profile: profileName,
     provider: "cloudflare-r2",
-    bucket: creds.bucket,
-    endpoint: creds.endpoint,
+    bucket: profile.bucket,
+    endpoint: profile.endpoint,
     auth_source: source,
+    auth_type: DEFAULT_REMOTE_AUTH_TYPE,
+    dotenv_path: dotenvPath,
   };
 }
 
@@ -1319,35 +1345,6 @@ function resolveAuthSource(args) {
   if (args.fromClipboard) return "clipboard";
   if (args.fromEnv) return "env";
   return args.authSource || "dotenv";
-}
-
-function readR2CredentialsForSource(source, args) {
-  if (source === "clipboard") {
-    return readR2CredentialsFromDotenvFromClipboard();
-  }
-  if (source === "env") {
-    return readR2CredentialsFromEnv(process.env);
-  }
-  if (source === "dotenv") {
-    return readR2CredentialsFromDotenv(args.dotenv || ensureGlobalDotenvTemplate());
-  }
-  throw new Error(`Unsupported auth source: ${source}`);
-}
-
-function assertValidR2Credentials(creds, source, args) {
-  const missing = ["account_id", "bucket", "access_key_id", "secret_access_key"].filter((field) => !String(creds?.[field] || "").trim());
-  if (!missing.length) {
-    return;
-  }
-  if (source === "dotenv") {
-    const dotenvPath = path.resolve(args.dotenv || ensureGlobalDotenvTemplate());
-    throw new Error(`Missing R2 credentials in ${dotenvPath}: ${missing.join(", ")}`);
-  }
-  throw new Error(`Missing R2 credentials from ${source}: ${missing.join(", ")}`);
-}
-
-function readR2CredentialsFromDotenvFromClipboard() {
-  return require("./lib/remote-auth").parseR2Credentials(readClipboardText());
 }
 
 function mask(value) {
@@ -1359,6 +1356,7 @@ function mask(value) {
 module.exports = {
   main,
   parseArgs,
+  resolveRepoSlug,
 };
 
 if (require.main === module) {

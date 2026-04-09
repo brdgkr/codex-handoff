@@ -14,7 +14,7 @@ const {
   watchServiceStatePath,
 } = require("./common");
 const { CursorStore } = require("./cursor_store");
-const { loadDefaultR2Profile } = require("../lib/runtime-config");
+const { loadRepoR2Profile } = require("../lib/repo-auth");
 const { findManagedRepoForCwd, loadManagedRepos } = require("./repo_registry");
 const { isRolloutPath, readRolloutLastRecordSummary, readRolloutMeta } = require("./rollout_meta");
 const { readIncrementalJsonl } = require("./rollout_incremental");
@@ -47,8 +47,13 @@ function parseArgs(argv) {
   return result;
 }
 
-function log(message) {
-  process.stdout.write(`[watch-service] ${message}\n`);
+function log(message, logPath = null) {
+  const line = `[watch-service] ${new Date().toISOString()} ${message}\n`;
+  if (logPath) {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.appendFileSync(logPath, line, "utf8");
+  }
+  process.stdout.write(line);
 }
 
 function ensureSingleton(statePath) {
@@ -96,27 +101,44 @@ async function main() {
   const sessionsRoot = path.join(options.codexHome, "sessions");
   const statePath = watchServiceStatePath(options.configDir);
   const serviceStartAt = new Date().toISOString();
+  const serviceLogPath = path.join(options.configDir, "logs", "watch-service.log");
   const eventLogPath = path.join(options.configDir, "logs", "watch-events.log");
   const rawEventLogPath = path.join(options.configDir, "logs", "watch-raw-events.log");
   const changedFilesLogPath = path.join(options.configDir, "logs", "watch-changed-files.log");
   const contentLogPath = path.join(options.configDir, "logs", "watch-content.log");
   if (ensureSingleton(statePath)) {
-    log("watch service already running");
+    log("watch service already running", serviceLogPath);
     return;
   }
 
-  const r2Profile = loadDefaultR2Profile(options.configDir);
   const cursorStore = new CursorStore(options.configDir);
   const scheduler = new RepoSyncScheduler({
     debounceMs: options.debounceMs,
-    runSync: (repo, payload) =>
-      syncChangedThreads(repo.repoPath, path.join(repo.repoPath, ".codex-handoff"), r2Profile, {
+    runSync: async (repo, payload) => {
+      const memoryDir = path.join(repo.repoPath, ".codex-handoff");
+      let profile = null;
+      let authError = null;
+      try {
+        profile = loadRepoR2Profile(memoryDir);
+      } catch (error) {
+        authError = error;
+      }
+      const result = await syncChangedThreads(repo.repoPath, memoryDir, profile, {
         codexHome: options.codexHome,
         includeRawThreads: repo.includeRawThreads === true,
         prefix: repo.remotePrefix,
         changes: payload?.changes || [],
-      }),
-    logger: log,
+      });
+      if (authError) {
+        log(`remote push skipped ${repo.repoPath}: ${authError.message}`, serviceLogPath);
+      } else if (result.remote_error) {
+        log(`remote push failed ${repo.repoPath}: ${result.remote_error}`, serviceLogPath);
+      } else if (result.remote_push_succeeded) {
+        log(`remote push ok ${repo.repoPath}: uploaded=${result.objects_uploaded}`, serviceLogPath);
+      }
+      return result;
+    },
+    logger: (message) => log(message, serviceLogPath),
   });
 
   let nativeWatcher;
@@ -163,7 +185,7 @@ async function main() {
     void handleFsEvent(eventType, changedPath);
   });
   nativeWatcher.on("error", (error) => {
-    log(`watcher error: ${error.message}`);
+    log(`watcher error: ${error.message}`, serviceLogPath);
   });
 
   writeState(statePath, {
@@ -173,6 +195,7 @@ async function main() {
     package_version: PACKAGE_VERSION,
     config_dir: options.configDir,
     codex_home: options.codexHome,
+    service_log_path: serviceLogPath,
     watch_root: sessionsRoot,
     debounce_ms: options.debounceMs,
     event_log_path: eventLogPath,
@@ -263,7 +286,7 @@ async function main() {
   }
 
   async function processEvents(events) {
-      const managedRepos = loadManagedRepos(options.configDir);
+      const managedRepos = loadManagedRepos(options.configDir).filter((repo) => fs.existsSync(repo.repoPath));
       const queued = new Map();
       for (const event of events) {
         if (event.type !== "create" && event.type !== "update") {
@@ -362,7 +385,7 @@ async function main() {
       });
   }
 
-  log(`watching ${sessionsRoot}`);
+  log(`watching ${sessionsRoot}`, serviceLogPath);
   await new Promise(() => {});
 }
 

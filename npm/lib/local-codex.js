@@ -84,20 +84,40 @@ function sessionIndexRemovalCount(filePath, threadId) {
   return count;
 }
 
-function discoverThreadsForRepo(repoPath, codexHome) {
+function discoverThreadsForRepo(repoPath, codexHome, repoState = null) {
   const paths = codexPaths(codexHome);
   if (!fs.existsSync(paths.stateDbPath)) {
     return [];
   }
   const repoKey = normalizeCwd(repoPath);
-  const repoOrigin = normalizeGitOriginUrl(repoGitOriginUrl(repoPath));
+  const repoNameHints = [
+    path.basename(repoPath).trim().toLowerCase(),
+    gitOriginRepoName(repoGitOriginUrl(repoPath)),
+    gitOriginRepoName(repoState?.git_origin_url || null),
+    ...(Array.isArray(repoState?.git_origin_urls) ? repoState.git_origin_urls.map((value) => gitOriginRepoName(value)) : []),
+  ].filter(Boolean);
   const indexMap = readSessionIndexMap(paths.sessionIndexPath);
   const db = new Database(paths.stateDbPath, { readonly: true, fileMustExist: true });
   try {
     const stmt = db.prepare("SELECT * FROM threads ORDER BY updated_at DESC");
     const rows = stmt.all();
+    const observedOrigins = gitOriginAliases(
+      rows
+        .filter((row) => normalizeCwd(row.cwd) === repoKey)
+        .map((row) => row.git_origin_url || null)
+        .filter((value) => {
+          const repoName = gitOriginRepoName(value);
+          return repoName && repoNameHints.includes(repoName);
+        }),
+    );
+    const repoOrigins = gitOriginAliases(
+      repoGitOriginUrl(repoPath),
+      repoState?.git_origin_url || null,
+      Array.isArray(repoState?.git_origin_urls) ? repoState.git_origin_urls : [],
+      observedOrigins,
+    );
     return rows
-      .filter((row) => threadMatchesRepo(row, repoKey, repoOrigin))
+      .filter((row) => threadMatchesRepo(row, repoKey, repoOrigins))
       .map((row) => ({
         threadId: row.id,
         title: row.title,
@@ -240,10 +260,13 @@ function cleanupThread(paths, threadId, { apply = false } = {}) {
   return result;
 }
 
-function threadMatchesRepo(row, repoKey, repoOrigin) {
+function threadMatchesRepo(row, repoKey, repoOrigins) {
   const rowOrigin = normalizeGitOriginUrl(String(row.git_origin_url || ""));
-  if (repoOrigin && rowOrigin) {
-    return rowOrigin === repoOrigin;
+  if (rowOrigin) {
+    if (Array.isArray(repoOrigins) && repoOrigins.length > 0) {
+      return repoOrigins.some((origin) => normalizeGitOriginUrl(origin) === rowOrigin);
+    }
+    return normalizeCwd(row.cwd) === repoKey;
   }
   return normalizeCwd(row.cwd) === repoKey;
 }
@@ -283,6 +306,55 @@ function normalizeGitOriginUrl(value) {
   return normalized || null;
 }
 
+function gitOriginRepoName(value) {
+  const normalized = normalizeGitOriginUrl(value);
+  if (!normalized) {
+    return null;
+  }
+  const parts = normalized.split("/");
+  return parts.length ? parts[parts.length - 1] : null;
+}
+
+function gitOriginAliases(...values) {
+  const aliases = [];
+  const seen = new Set();
+  for (const value of values.flat()) {
+    appendGitOriginAlias(aliases, seen, value);
+  }
+  return aliases;
+}
+
+function mergeGitOriginState(currentOrigin, previousOrigin = null, previousOrigins = []) {
+  const current = String(currentOrigin || "").trim() || String(previousOrigin || "").trim() || null;
+  const history = [];
+  const seen = new Set();
+  const currentKey = normalizeGitOriginUrl(current);
+  if (currentKey) {
+    seen.add(currentKey);
+  }
+  appendGitOriginAlias(history, seen, previousOrigin);
+  for (const value of previousOrigins || []) {
+    appendGitOriginAlias(history, seen, value);
+  }
+  return {
+    git_origin_url: current,
+    git_origin_urls: history,
+  };
+}
+
+function appendGitOriginAlias(target, seen, value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return;
+  }
+  const normalized = normalizeGitOriginUrl(raw);
+  if (!normalized || seen.has(normalized)) {
+    return;
+  }
+  seen.add(normalized);
+  target.push(raw);
+}
+
 function stripWindowsPrefix(value) {
   return value.startsWith("\\\\?\\") ? value.slice(4) : value;
 }
@@ -299,6 +371,8 @@ module.exports = {
   deleteThreadRow,
   discoverThreadsForRepo,
   findRolloutPath,
+  gitOriginAliases,
+  mergeGitOriginState,
   normalizeCwd,
   normalizeGitOriginUrl,
   readRolloutRecords,

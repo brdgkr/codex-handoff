@@ -61,17 +61,18 @@ Inspect background agent and watcher state.
 
 ### `codex-handoff remote login r2`
 
-Register a Cloudflare R2 profile.
+Validate or write Cloudflare R2 credentials into the current repo's
+`.codex-handoff/.env.local`.
 
 Useful variants:
 
 - `--from-clipboard`
 - `--from-env`
-- `--dotenv ~/.codex-handoff/.env.local`
+- `--dotenv ./.codex-handoff/.env.local`
 
 ### `codex-handoff remote whoami`
 
-Show the active remote profile.
+Show the current repo's active R2 credentials source.
 
 ### `codex-handoff remote validate`
 
@@ -79,7 +80,7 @@ Validate the active remote credentials.
 
 ### `codex-handoff remote logout`
 
-Remove the locally stored remote profile.
+Clear the current repo's `.codex-handoff/.env.local` credentials file.
 
 ### `codex-handoff remote repos`
 

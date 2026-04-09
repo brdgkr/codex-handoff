@@ -1,7 +1,8 @@
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+
+const { withHiddenWindows } = require("./child-process");
 
 function parseR2Credentials(text) {
   const stripped = String(text || "").trim();
@@ -53,31 +54,6 @@ function readR2CredentialsFromEnv(env = process.env) {
   return payload;
 }
 
-function defaultGlobalDotenvPath() {
-  return path.join(os.homedir(), ".codex-handoff", ".env.local");
-}
-
-function ensureGlobalDotenvTemplate() {
-  const filePath = defaultGlobalDotenvPath();
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  if (!fs.existsSync(filePath)) {
-    fs.writeFileSync(
-      filePath,
-      [
-        "# Cloudflare R2 credentials for codex-handoff",
-        "account_id=",
-        "bucket=",
-        "access_key_id=",
-        "secret_access_key=",
-        "# endpoint=https://<account_id>.r2.cloudflarestorage.com",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-  }
-  return filePath;
-}
-
 function readClipboardText() {
   if (process.platform === "darwin") {
     const result = spawnSync("pbpaste", { encoding: "utf8" });
@@ -88,7 +64,7 @@ function readClipboardText() {
     const result = spawnSync(
       "powershell",
       ["-NoProfile", "-Command", "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $text = Get-Clipboard -Raw; if ($null -eq $text) { '' } else { $text }"],
-      { encoding: "utf8" },
+      withHiddenWindows({ encoding: "utf8" }),
     );
     if (result.status !== 0) throw new Error(result.stderr.trim() || "Failed to read clipboard.");
     return result.stdout || "";
@@ -121,8 +97,6 @@ function normalizeFields(items) {
 }
 
 module.exports = {
-  defaultGlobalDotenvPath,
-  ensureGlobalDotenvTemplate,
   parseR2Credentials,
   readClipboardText,
   readR2CredentialsFromDotenv,

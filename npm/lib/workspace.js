@@ -1,8 +1,10 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
+const { canonicalizeRepoPath } = require("../service/common");
 const { gitOriginUrlFromRepo } = require("./git-config");
-const { normalizeCwd } = require("./local-codex");
+const { mergeGitOriginState, normalizeCwd } = require("./local-codex");
+const { DEFAULT_REMOTE_AUTH_PATH, DEFAULT_REMOTE_AUTH_TYPE } = require("./repo-auth");
 
 const MANAGED_BLOCK_START = "<!-- codex-handoff:start -->";
 const MANAGED_BLOCK_END = "<!-- codex-handoff:end -->";
@@ -24,24 +26,24 @@ function syncStatePath(memoryDir) {
 }
 
 function loadRepoState(memoryDir) {
-  return readJson(repoStatePath(memoryDir), {});
+  return normalizeRepoState(readJson(repoStatePath(memoryDir), {}));
 }
 
 function saveRepoState(memoryDir, payload) {
   ensureMemoryLayout(memoryDir);
   const filePath = repoStatePath(memoryDir);
-  fs.writeFileSync(filePath, JSON.stringify(payload, null, 2) + "\n", "utf8");
+  fs.writeFileSync(filePath, JSON.stringify(normalizeRepoState(payload), null, 2) + "\n", "utf8");
   return filePath;
 }
 
 function loadSyncState(memoryDir) {
-  return readJson(syncStatePath(memoryDir), {});
+  return normalizeSyncState(readJson(syncStatePath(memoryDir), {}));
 }
 
 function saveSyncState(memoryDir, payload) {
   ensureMemoryLayout(memoryDir);
   const filePath = syncStatePath(memoryDir);
-  fs.writeFileSync(filePath, JSON.stringify(payload, null, 2) + "\n", "utf8");
+  fs.writeFileSync(filePath, JSON.stringify(normalizeSyncState(payload), null, 2) + "\n", "utf8");
   return filePath;
 }
 
@@ -71,8 +73,14 @@ function inferRepoSlug(repoPath) {
   return slugify(path.basename(repoPath));
 }
 
-function buildRepoState(repoPath, { profileName, machineId, remoteSlug = null, includeRawThreads = false, summaryMode = "auto", matchMode = "auto", matchStatus = "create_new", projectName = null }) {
+function buildRepoState(repoPath, { profileName, machineId, remoteSlug = null, includeRawThreads = false, summaryMode = "auto", matchMode = "auto", matchStatus = "create_new", projectName = null, previousRepoState = null }) {
   const slug = remoteSlug || inferRepoSlug(repoPath);
+  const previousOrigins = normalizeRepoState(previousRepoState);
+  const gitOrigins = mergeGitOriginState(
+    gitOriginUrl(repoPath),
+    previousOrigins.git_origin_url || null,
+    previousOrigins.git_origin_urls || [],
+  );
   return {
     schema_version: "1.0",
     machine_id: machineId,
@@ -88,25 +96,34 @@ function buildRepoState(repoPath, { profileName, machineId, remoteSlug = null, i
     },
     repo_path: normalizeCwd(repoPath),
     repo_slug: slug,
-    remote_profile: profileName,
+    remote_auth_type: DEFAULT_REMOTE_AUTH_TYPE,
+    remote_auth_path: DEFAULT_REMOTE_AUTH_PATH,
     remote_prefix: `repos/${slug}/`,
     include_raw_threads: includeRawThreads,
     summary_mode: summaryMode,
     match_mode: matchMode,
     match_status: matchStatus,
-    git_origin_url: gitOriginUrl(repoPath),
+    git_origin_url: gitOrigins.git_origin_url,
+    git_origin_urls: gitOrigins.git_origin_urls,
     updated_at: new Date().toISOString(),
   };
 }
 
 function registerRepoMapping(configPayload, repoPath, repoState) {
   const repos = configPayload.repos || (configPayload.repos = {});
-  repos[normalizeCwd(repoPath)] = {
+  const canonicalRepoPath = canonicalizeRepoPath(repoPath);
+  for (const existingKey of Object.keys(repos)) {
+    if (normalizeCwd(existingKey) === normalizeCwd(canonicalRepoPath)) {
+      delete repos[existingKey];
+    }
+  }
+  repos[canonicalRepoPath] = {
     machine_id: repoState.machine_id,
     project_name: repoState.project_name || "",
-    workspace_root: repoState.workspace_root || "",
+    workspace_root: repoState.workspace_root || canonicalRepoPath,
     repo_slug: repoState.repo_slug,
-    remote_profile: repoState.remote_profile,
+    remote_auth_type: repoState.remote_auth_type || DEFAULT_REMOTE_AUTH_TYPE,
+    remote_auth_path: repoState.remote_auth_path || DEFAULT_REMOTE_AUTH_PATH,
     remote_prefix: repoState.remote_prefix,
     summary_mode: repoState.summary_mode,
     include_raw_threads: repoState.include_raw_threads,
@@ -120,13 +137,16 @@ function registerRepoMapping(configPayload, repoPath, repoState) {
 function unregisterRepoMapping(configPayload, repoPath) {
   const repos = configPayload.repos || (configPayload.repos = {});
   const key = normalizeCwd(repoPath);
-  const existed = Object.prototype.hasOwnProperty.call(repos, key);
-  if (existed) {
-    delete repos[key];
+  let removed = false;
+  for (const existingKey of Object.keys(repos)) {
+    if (existingKey === repoPath || normalizeCwd(existingKey) === key) {
+      delete repos[existingKey];
+      removed = true;
+    }
   }
   return {
     config: configPayload,
-    removed: existed,
+    removed,
     remaining_repo_count: Object.keys(repos).length,
   };
 }
@@ -218,7 +238,8 @@ function renderAgentsBlock(repoState) {
     "This repository is attached to codex-handoff sync.",
     `- local project name: \`${repoState.project_name || ""}\``,
     `- local workspace root: \`${repoState.workspace_root || ""}\``,
-    `- remote profile: \`${repoState.remote_profile}\``,
+    `- remote auth: \`${repoState.remote_auth_type || DEFAULT_REMOTE_AUTH_TYPE}\``,
+    `- remote auth file: \`${repoState.remote_auth_path || DEFAULT_REMOTE_AUTH_PATH}\``,
     `- remote repo slug: \`${repoState.repo_slug}\``,
     `- remote prefix: \`${repoState.remote_prefix}\``,
     `- summary mode: \`${repoState.summary_mode}\``,
@@ -266,6 +287,77 @@ function readJson(filePath, fallback) {
   }
 }
 
+function normalizeRepoState(payload) {
+  if (!payload || typeof payload !== "object") {
+    return {};
+  }
+  const normalized = { ...payload };
+  delete normalized.remote_profile;
+  if (normalized.repo_slug) {
+    normalized.remote_auth_type = DEFAULT_REMOTE_AUTH_TYPE;
+    normalized.remote_auth_path = DEFAULT_REMOTE_AUTH_PATH;
+  }
+  const gitOrigins = mergeGitOriginState(
+    normalized.git_origin_url || null,
+    null,
+    Array.isArray(normalized.git_origin_urls) ? normalized.git_origin_urls : [],
+  );
+  normalized.git_origin_url = gitOrigins.git_origin_url;
+  normalized.git_origin_urls = gitOrigins.git_origin_urls;
+  return normalized;
+}
+
+function normalizeSyncState(payload) {
+  if (!payload || typeof payload !== "object") {
+    return {};
+  }
+  const normalized = { ...payload };
+  delete normalized.remote_profile;
+  if (normalized.repo_slug) {
+    normalized.remote_auth_type = DEFAULT_REMOTE_AUTH_TYPE;
+    normalized.remote_auth_path = DEFAULT_REMOTE_AUTH_PATH;
+  }
+  return normalized;
+}
+
+function relocalizeRepoState(repoPath, repoState, fallbackState = {}) {
+  const source = normalizeRepoState(repoState);
+  const fallback = normalizeRepoState(fallbackState);
+  if (!source.repo_slug && !fallback.repo_slug) {
+    return normalizeRepoState(source);
+  }
+  const projectName = fallback.project_name || source.project_name || path.basename(repoPath);
+  const localized = buildRepoState(repoPath, {
+    machineId: fallback.machine_id || source.machine_id || null,
+    remoteSlug: source.repo_slug || fallback.repo_slug || null,
+    includeRawThreads: source.include_raw_threads === true || fallback.include_raw_threads === true,
+    summaryMode: source.summary_mode || fallback.summary_mode || "auto",
+    matchMode: fallback.match_mode || source.match_mode || "auto",
+    matchStatus: fallback.match_status || source.match_status || "existing_local",
+    projectName,
+    previousRepoState: {
+      git_origin_url: source.git_origin_url || fallback.git_origin_url || null,
+      git_origin_urls: [
+        ...(Array.isArray(source.git_origin_urls) ? source.git_origin_urls : []),
+        ...(Array.isArray(fallback.git_origin_urls) ? fallback.git_origin_urls : []),
+      ],
+    },
+  });
+  const codexProject = source.codex_project || fallback.codex_project || {};
+  localized.codex_project = {
+    project_name: projectName,
+    workspace_root: repoPath,
+    is_active: Boolean(codexProject.is_active),
+    is_saved: Boolean(codexProject.is_saved),
+    is_in_project_order: Boolean(codexProject.is_in_project_order),
+    is_in_sidebar_groups: Boolean(codexProject.is_in_sidebar_groups),
+  };
+  if (fallback.installed_skill_path || source.installed_skill_path) {
+    localized.installed_skill_path = fallback.installed_skill_path || source.installed_skill_path;
+  }
+  return localized;
+}
+
 module.exports = {
   currentThreadPath,
   buildRepoState,
@@ -280,6 +372,7 @@ module.exports = {
   removeAgentsBlock,
   removeMemoryDirGitignoreEntry,
   registerRepoMapping,
+  relocalizeRepoState,
   unregisterRepoMapping,
   saveRepoState,
   repoStatePath,

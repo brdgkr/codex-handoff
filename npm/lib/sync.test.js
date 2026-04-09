@@ -3,8 +3,10 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { execFileSync } = require("node:child_process");
 
-const { updateThreadBundleFromRolloutChange } = require("./sync");
+const { dbCwd, dbRolloutPath, discoverThreadsForRepo, upsertThreadRow } = require("./local-codex");
+const { applyChangedThreadsLocally, syncChangedThreads, updateThreadBundleFromRolloutChange } = require("./sync");
 
 function makeThread(overrides = {}) {
   return {
@@ -30,6 +32,43 @@ function makeThread(overrides = {}) {
     },
     ...overrides,
   };
+}
+
+function runGit(repoDir, ...args) {
+  execFileSync("git", args, {
+    cwd: repoDir,
+    stdio: "ignore",
+  });
+}
+
+function seedThread(stateDbPath, repoDir, { id, gitOriginUrl = null, updatedAt = 2 }) {
+  upsertThreadRow(stateDbPath, {
+    id,
+    rollout_path: dbRolloutPath(path.join(repoDir, `${id}.jsonl`)),
+    created_at: 1,
+    updated_at: updatedAt,
+    source: "vscode",
+    model_provider: "openai",
+    cwd: dbCwd(repoDir),
+    title: id,
+    sandbox_policy: JSON.stringify({ type: "danger-full-access" }),
+    approval_mode: "never",
+    tokens_used: 0,
+    has_user_event: 0,
+    archived: 0,
+    archived_at: null,
+    git_sha: null,
+    git_branch: "main",
+    git_origin_url: gitOriginUrl,
+    cli_version: "",
+    first_user_message: "",
+    agent_nickname: null,
+    agent_role: null,
+    memory_mode: "enabled",
+    model: "gpt-5.4",
+    reasoning_effort: "xhigh",
+    agent_path: null,
+  });
 }
 
 test("updateThreadBundleFromRolloutChange creates a bundle from appended canonical messages only", () => {
@@ -113,4 +152,139 @@ test("updateThreadBundleFromRolloutChange appends new canonical messages to an e
     result.transcript.map((item) => item.message),
     ["hello user", "second reply"],
   );
+});
+
+test("applyChangedThreadsLocally updates thread bundles without remote auth", () => {
+  const memoryDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-sync-local-only-"));
+  const thread = makeThread();
+
+  const result = applyChangedThreadsLocally("/workspace/project", memoryDir, {
+    codexHome: "/tmp/codex-home",
+    includeRawThreads: false,
+    discoverThreads: () => [thread],
+    changes: [
+      {
+        threadId: "thread-123",
+        newLines: [
+          JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "hello user" } }),
+          JSON.stringify({ type: "event_msg", payload: { type: "agent_message", message: "hello assistant", phase: "final_answer" } }),
+        ],
+        parserState: { sessionId: "thread-123", currentTurnId: "turn-1" },
+      },
+    ],
+  });
+
+  assert.equal(result.threads_exported, 1);
+  assert.deepEqual(result.thread_ids, ["thread-123"]);
+  assert.equal(fs.existsSync(path.join(memoryDir, "threads", "thread-123.json")), true);
+});
+
+test("applyChangedThreadsLocally synthesizes a watched thread when SQLite metadata is missing", () => {
+  const memoryDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-sync-synth-"));
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-sync-synth-home-"));
+  const rolloutDir = path.join(codexHome, "sessions", "2026", "04", "09");
+  const rolloutPath = path.join(rolloutDir, "rollout-2026-04-09T13-17-40-thread-new.jsonl");
+  fs.mkdirSync(rolloutDir, { recursive: true });
+  fs.writeFileSync(rolloutPath, [
+    JSON.stringify({ type: "session_meta", payload: { id: "thread-new", cwd: "/workspace/project" } }),
+    JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "hello from watcher" } }),
+    "",
+  ].join("\n"), "utf8");
+  fs.writeFileSync(path.join(codexHome, "session_index.jsonl"), `${JSON.stringify({
+    id: "thread-new",
+    thread_name: "Watched Thread",
+    updated_at: "2026-04-09T13:17:46.7410438Z",
+  })}\n`, "utf8");
+
+  const result = applyChangedThreadsLocally("/workspace/project", memoryDir, {
+    codexHome,
+    includeRawThreads: false,
+    discoverThreads: () => [],
+    changes: [
+      {
+        threadId: "thread-new",
+        rolloutPath,
+        cwd: "/workspace/project",
+        newLines: [
+          JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "hello from watcher" } }),
+          JSON.stringify({ type: "event_msg", payload: { type: "agent_message", message: "watch reply", phase: "final_answer" } }),
+        ],
+        parserState: { sessionId: "thread-new", currentTurnId: "turn-1" },
+      },
+    ],
+  });
+
+  assert.equal(result.threads_exported, 1);
+  assert.deepEqual(result.thread_ids, ["thread-new"]);
+  assert.equal(fs.existsSync(path.join(memoryDir, "threads", "thread-new.json")), true);
+  const transcript = JSON.parse(fs.readFileSync(path.join(memoryDir, "threads", "thread-new.json"), "utf8"));
+  assert.deepEqual(transcript.map((item) => item.message), ["hello from watcher", "watch reply"]);
+  const index = JSON.parse(fs.readFileSync(path.join(memoryDir, "thread-index.json"), "utf8"));
+  assert.equal(index[0].thread_name, "Watched Thread");
+});
+
+test("discoverThreadsForRepo recovers matching historical git origins from same-cwd rows", () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-origin-match-"));
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-codex-home-"));
+  const stateDbPath = path.join(codexHome, "state_5.sqlite");
+
+  runGit(repoDir, "init");
+  runGit(repoDir, "remote", "add", "origin", "https://github.com/brdgkr/codex-handoff.git");
+
+  seedThread(stateDbPath, repoDir, {
+    id: "thread-current",
+    gitOriginUrl: "https://github.com/brdgkr/codex-handoff.git",
+    updatedAt: 4,
+  });
+  seedThread(stateDbPath, repoDir, {
+    id: "thread-old",
+    gitOriginUrl: "https://github.com/ideook/codex-handoff.git",
+    updatedAt: 3,
+  });
+  seedThread(stateDbPath, repoDir, {
+    id: "thread-null",
+    gitOriginUrl: null,
+    updatedAt: 2,
+  });
+  seedThread(stateDbPath, repoDir, {
+    id: "thread-other",
+    gitOriginUrl: "https://github.com/example/other-repo.git",
+    updatedAt: 1,
+  });
+
+  const threads = discoverThreadsForRepo(repoDir, codexHome, {
+    git_origin_url: "https://github.com/brdgkr/codex-handoff.git",
+    git_origin_urls: [],
+  });
+
+  assert.deepEqual(
+    threads.map((thread) => thread.threadId),
+    ["thread-current", "thread-old", "thread-null"],
+  );
+});
+
+test("syncChangedThreads keeps local thread updates when remote push is unavailable", async () => {
+  const memoryDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-sync-remote-skip-"));
+  const thread = makeThread();
+
+  const result = await syncChangedThreads("/workspace/project", memoryDir, null, {
+    codexHome: "/tmp/codex-home",
+    includeRawThreads: false,
+    prefix: "repos/project/",
+    discoverThreads: () => [thread],
+    changes: [
+      {
+        threadId: "thread-123",
+        newLines: [
+          JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "hello user" } }),
+        ],
+        parserState: { sessionId: "thread-123", currentTurnId: "turn-1" },
+      },
+    ],
+  });
+
+  assert.equal(result.remote_push_attempted, false);
+  assert.equal(result.remote_push_succeeded, false);
+  assert.equal(result.threads_exported, 1);
+  assert.equal(fs.existsSync(path.join(memoryDir, "threads", "thread-123.json")), true);
 });

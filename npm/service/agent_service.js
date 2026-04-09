@@ -6,7 +6,7 @@ const process = require("node:process");
 
 const { serviceState, clearServiceState } = require("../lib/agent-runtime");
 const { detectCodexProcesses, findScriptProcessPids } = require("../lib/process-utils");
-const { loadDefaultR2Profile } = require("../lib/runtime-config");
+const { loadRepoR2Profile } = require("../lib/repo-auth");
 const { pullRepoMemorySnapshot } = require("../lib/sync");
 const { watchServiceState, isWatchServiceRunning, startWatchService, stopWatchService } = require("../lib/watch-runtime");
 const { loadRepoState } = require("../lib/workspace");
@@ -232,7 +232,6 @@ async function runStartupSync(configDir, codexHome, logger) {
     };
   }
 
-  const profile = loadDefaultR2Profile(configDir);
   const syncedRepos = [];
   const errors = [];
   let skippedRepoCount = 0;
@@ -251,6 +250,7 @@ async function runStartupSync(configDir, codexHome, logger) {
       continue;
     }
     try {
+      const profile = loadRepoR2Profile(memoryDir);
       const result = await pullRepoMemorySnapshot(repo.repoPath, memoryDir, profile, repoState, { codexHome });
       const entry = {
         repo: repo.repoPath,
@@ -263,6 +263,7 @@ async function runStartupSync(configDir, codexHome, logger) {
       syncedRepos.push(entry);
       recordManagedRepoEvent(configDir, "startup_sync_repo", entry, [repo.repoPath]);
     } catch (error) {
+      logger.write(`startup sync error ${repo.repoPath}: ${error.message}`);
       const entry = {
         repo: repo.repoPath,
         repo_slug: repo.repoSlug,

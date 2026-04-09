@@ -90,6 +90,18 @@ function normalizeComparablePath(value) {
   return path.posix.normalize(raw.replace(/\\/g, "/")).replace(/\/+$/, "");
 }
 
+function canonicalizeRepoPath(value) {
+  const raw = stripWindowsPrefix(String(value || "").trim());
+  if (!raw) {
+    return "";
+  }
+  if (isWindowsStylePath(raw)) {
+    const normalized = path.win32.normalize(raw).replace(/[\\/]+$/, "");
+    return normalized.replace(/^([a-z]):/u, (_, drive) => `${drive.toUpperCase()}:`);
+  }
+  return path.posix.normalize(raw.replace(/\\/g, "/")).replace(/\/+$/, "");
+}
+
 function isSameOrDescendantPath(candidatePath, parentPath) {
   if (!candidatePath || !parentPath) {
     return false;
@@ -103,6 +115,7 @@ function isSameOrDescendantPath(candidatePath, parentPath) {
 module.exports = {
   agentServiceStatePath,
   configPath,
+  canonicalizeRepoPath,
   installRestartStatePath,
   isSameOrDescendantPath,
   lifecycleLockPath,

@@ -33,6 +33,29 @@ test("loadManagedRepos returns normalized managed repos sorted by specificity", 
   assert.equal(repos[1].repoSlug, "workspace");
 });
 
+test("loadManagedRepos dedupes repo entries that only differ by Windows path casing and separators", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-config-"));
+  const configPath = path.join(tempDir, "config.json");
+  fs.writeFileSync(
+    configPath,
+    JSON.stringify(
+      {
+        repos: {
+          "D:\\source\\repos\\ideook\\codex-handoff": { repo_slug: "older", updated_at: "2026-04-01T00:00:00.000Z" },
+          "d:/source/repos/ideook/codex-handoff": { repo_slug: "newer", updated_at: "2026-04-09T00:00:00.000Z" },
+        },
+      },
+      null,
+      2
+    )
+  );
+
+  const repos = loadManagedRepos(tempDir);
+  assert.equal(repos.length, 1);
+  assert.equal(repos[0].repoSlug, "newer");
+  assert.equal(normalizeComparablePath(repos[0].repoPath), "d:/source/repos/ideook/codex-handoff");
+});
+
 test("findManagedRepoForCwd matches the longest managed ancestor", () => {
   const managedRepos = [
     { repoPath: "/workspace/project", normalizedPath: normalizeComparablePath("/workspace/project"), repoSlug: "project" },

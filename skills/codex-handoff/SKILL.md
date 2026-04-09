@@ -87,7 +87,7 @@ If the user does not explicitly agree, stop after the one-shot sync and report t
 
 The CLI should use this default auth file:
 
-- `~/.codex-handoff/.env.local`
+- `.codex-handoff/.env.local`
 
 If a different file is needed, pass `--dotenv <path>` explicitly.
 
@@ -131,7 +131,7 @@ Prefer not to paste secrets into the Codex chat.
 
 Recommended sources:
 
-- `~/.codex-handoff/.env.local`
+- `.codex-handoff/.env.local`
 - OS clipboard
 - process environment variables
 
@@ -139,8 +139,8 @@ Useful commands:
 
 - Show the Cloudflare setup URL and credential template:
   `codex-handoff remote login r2 --show-setup-info --open-dashboard`
-- Login from the default global dotenv file:
-  `codex-handoff remote login r2 --dotenv ~/.codex-handoff/.env.local`
+- Login from the current repo dotenv file:
+  `codex-handoff --repo . remote login r2 --dotenv ./.codex-handoff/.env.local`
 - Login from a specific dotenv file:
   `codex-handoff remote login r2 --dotenv <path>`
 - Login from clipboard:
@@ -160,7 +160,7 @@ When the user asks to continue previous work in a synced repo:
 
 ## Safety rules
 
-- Do not paste R2 secrets into the Codex chat when `~/.codex-handoff/.env.local`, clipboard, or env sources are available.
+- Do not paste R2 secrets into the Codex chat when `.codex-handoff/.env.local`, clipboard, or env sources are available.
 - Prefer `doctor`, `setup`, and `receive` over ad hoc filesystem searches.
 - Pull before the first push on a new machine.
 - Treat `.codex-handoff` as derived handoff state, not the original Codex source of truth.

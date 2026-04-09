@@ -5,7 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 
-const { parseArgs } = require("./cli");
+const { parseArgs, resolveRepoSlug } = require("./cli");
 const { buildRepoState } = require("./lib/workspace");
 
 const cliPath = path.join(__dirname, "bin", "codex-handoff.js");
@@ -55,7 +55,8 @@ function makeFixtureRepo() {
       {
         repo_path: repoDir,
         repo_slug: "fixture-remote",
-        remote_profile: "default",
+        remote_auth_type: "global_dotenv",
+        remote_auth_path: "~/.codex-handoff/.env.local",
         remote_prefix: "repos/fixture-remote/",
         summary_mode: "heuristic",
         include_raw_threads: false,
@@ -72,7 +73,8 @@ function makeFixtureRepo() {
         schema_version: "1.0",
         repo: repoDir,
         repo_slug: "fixture-remote",
-        remote_profile: "default",
+        remote_auth_type: "global_dotenv",
+        remote_auth_path: "~/.codex-handoff/.env.local",
         remote_prefix: "repos/fixture-remote/",
         last_sync_at: "2026-04-07T00:00:00Z",
         last_sync_direction: "push",
@@ -111,6 +113,13 @@ function makeFixtureRepo() {
   return repoDir;
 }
 
+function runGit(repoDir, ...args) {
+  execFileSync("git", args, {
+    cwd: repoDir,
+    stdio: "ignore",
+  });
+}
+
 test("CLI defaults to skipping raw thread archives and allows explicit opt-in", () => {
   const defaults = parseArgs(["threads", "export"]);
   assert.equal(defaults.includeRawThreads, null);
@@ -132,6 +141,85 @@ test("new repo state defaults to raw thread archives disabled", () => {
   });
 
   assert.equal(repoState.include_raw_threads, false);
+});
+
+test("resolveRepoSlug prefers the current origin-derived slug over stale local state", () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-slug-refresh-"));
+  const memoryDir = path.join(repoDir, ".codex-handoff");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  runGit(repoDir, "init");
+  runGit(repoDir, "remote", "add", "origin", "https://github.com/brdgkr/codex-handoff.git");
+  fs.writeFileSync(
+    path.join(memoryDir, "repo.json"),
+    JSON.stringify({
+      repo_slug: "ideook-codex-handoff",
+      match_status: "create_new",
+      git_origin_url: "https://github.com/brdgkr/codex-handoff.git",
+      git_origin_urls: ["https://github.com/ideook/codex-handoff.git"],
+    }, null, 2) + "\n",
+    "utf8",
+  );
+
+  const result = resolveRepoSlug(repoDir, memoryDir, {}, [
+    { repo_slug: "ideook-codex-handoff" },
+    { repo_slug: "brdgkr-codex-handoff" },
+  ], { project_name: "codex-handoff" });
+
+  assert.deepEqual(result, {
+    repo_slug: "brdgkr-codex-handoff",
+    match_status: "matched_remote_inferred",
+  });
+});
+
+test("resolveRepoSlug creates a new inferred slug when local state is stale and the new remote does not exist yet", () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-slug-create-"));
+  const memoryDir = path.join(repoDir, ".codex-handoff");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  runGit(repoDir, "init");
+  runGit(repoDir, "remote", "add", "origin", "https://github.com/brdgkr/codex-handoff.git");
+  fs.writeFileSync(
+    path.join(memoryDir, "repo.json"),
+    JSON.stringify({
+      repo_slug: "ideook-codex-handoff",
+      match_status: "create_new",
+    }, null, 2) + "\n",
+    "utf8",
+  );
+
+  const result = resolveRepoSlug(repoDir, memoryDir, {}, [
+    { repo_slug: "ideook-codex-handoff", git_origin_url: "https://github.com/brdgkr/codex-handoff.git" },
+  ], { project_name: "codex-handoff" });
+
+  assert.deepEqual(result, {
+    repo_slug: "brdgkr-codex-handoff",
+    match_status: "create_new",
+  });
+});
+
+test("resolveRepoSlug preserves an explicit local remote slug selection", () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-slug-explicit-"));
+  const memoryDir = path.join(repoDir, ".codex-handoff");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  runGit(repoDir, "init");
+  runGit(repoDir, "remote", "add", "origin", "https://github.com/brdgkr/codex-handoff.git");
+  fs.writeFileSync(
+    path.join(memoryDir, "repo.json"),
+    JSON.stringify({
+      repo_slug: "ideook-codex-handoff",
+      match_status: "explicit",
+    }, null, 2) + "\n",
+    "utf8",
+  );
+
+  const result = resolveRepoSlug(repoDir, memoryDir, {}, [
+    { repo_slug: "ideook-codex-handoff" },
+    { repo_slug: "brdgkr-codex-handoff" },
+  ], { project_name: "codex-handoff" });
+
+  assert.deepEqual(result, {
+    repo_slug: "ideook-codex-handoff",
+    match_status: "existing_local",
+  });
 });
 
 function runCli(repoDir, ...args) {
@@ -169,7 +257,7 @@ test("CLI status/search/resume/sync status work through the Node entrypoint", ()
   assert.equal(payload.sync_health.status, "ok");
 });
 
-test("CLI setup reports a friendly error when the default remote profile is missing", () => {
+test("CLI setup reports a friendly error when global R2 credentials are missing", () => {
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-setup-"));
   const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-config-"));
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-home-"));
@@ -192,8 +280,8 @@ test("CLI setup reports a friendly error when the default remote profile is miss
   }
 
   assert.ok(failure);
-  assert.match(String(failure.stderr || ""), /Remote profile not found: default\./);
-  assert.match(String(failure.stderr || ""), /Add your R2 credentials to/);
+  assert.match(String(failure.stderr || ""), /R2 credentials are required in/);
+  assert.equal(fs.existsSync(path.join(configDir, ".env.local")), true);
   assert.doesNotMatch(String(failure.stderr || ""), /npm\/cli\.js:/);
 });
 
@@ -225,7 +313,7 @@ test("CLI uninstall detaches the repo and preserves local memory", () => {
   fs.mkdirSync(memoryDir, { recursive: true });
   fs.writeFileSync(
     path.join(memoryDir, "repo.json"),
-    JSON.stringify({ repo_slug: "fixture-remote", remote_profile: "default" }, null, 2) + "\n",
+    JSON.stringify({ repo_slug: "fixture-remote", remote_auth_type: "global_dotenv", remote_auth_path: "~/.codex-handoff/.env.local" }, null, 2) + "\n",
     "utf8",
   );
   fs.writeFileSync(
@@ -248,8 +336,6 @@ test("CLI uninstall detaches the repo and preserves local memory", () => {
     path.join(configDir, "config.json"),
     JSON.stringify(
       {
-        default_profile: "default",
-        profiles: {},
         repos: {
           [repoDir]: { repo_slug: "fixture-remote" },
         },
@@ -279,4 +365,43 @@ test("CLI uninstall detaches the repo and preserves local memory", () => {
   assert.equal(fs.existsSync(memoryDir), true);
   assert.doesNotMatch(fs.readFileSync(path.join(repoDir, "AGENTS.md"), "utf8"), /codex-handoff:start/);
   assert.equal(fs.existsSync(path.join(repoDir, ".gitignore")), false);
+});
+
+test("CLI remote login stores credentials in global .codex-handoff/.env.local", () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-remote-login-"));
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-config-"));
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-home-"));
+
+  const output = execFileSync(process.execPath, [cliPath, "--repo", repoDir, "remote", "login", "r2", "--from-env"], {
+    cwd: path.join(__dirname, ".."),
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOME: homeDir,
+      CODEX_HANDOFF_CONFIG_DIR: configDir,
+      CODEX_HANDOFF_R2_ACCOUNT_ID: "acct",
+      CODEX_HANDOFF_R2_BUCKET: "bucket",
+      CODEX_HANDOFF_R2_ACCESS_KEY_ID: "key",
+      CODEX_HANDOFF_R2_SECRET_ACCESS_KEY: "secret",
+      NODE_NO_WARNINGS: "1",
+    },
+  });
+
+  const payload = JSON.parse(output);
+  assert.equal(payload.auth_type, "global_dotenv");
+  assert.equal(fs.existsSync(path.join(configDir, ".env.local")), true);
+
+  const whoami = JSON.parse(execFileSync(process.execPath, [cliPath, "--repo", repoDir, "remote", "whoami"], {
+    cwd: path.join(__dirname, ".."),
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOME: homeDir,
+      CODEX_HANDOFF_CONFIG_DIR: configDir,
+      NODE_NO_WARNINGS: "1",
+    },
+  }));
+  assert.equal(whoami.bucket, "bucket");
+  assert.equal(whoami.auth_type, "global_dotenv");
+  assert.equal(whoami.dotenv_path, path.join(configDir, ".env.local"));
 });

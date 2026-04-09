@@ -16,11 +16,10 @@ The first remote provider is:
 The user should experience `codex-handoff` as:
 
 - one remote account
-- one remote backend profile only
 - one local background agent per machine
 - one explicit attached repository per workspace the user wants to hand off
 - automatic sync of repo-related Codex thread bundles plus the matching `.codex-handoff/` view
-- explicit auth once per machine
+- explicit auth through each repo's `.codex-handoff/.env.local`
 - automatic pull before resuming work on another machine
 
 The key product terms are:
@@ -95,7 +94,7 @@ The initial prompt should be enough for Codex to:
 ## UX constraints
 
 - The install flow must clearly separate local install from remote auth.
-- The user should authenticate once per machine, not once per repo.
+- The user should authenticate through the current repo's `.codex-handoff/.env.local`.
 - Repo attachment should be explicit to avoid syncing unrelated workspaces.
 - The primary workflow is serial handoff across machines, not simultaneous collaborative editing.
 - The agent should pull before the first push on a machine after attach, login, wake, or restart.
@@ -199,7 +198,7 @@ The expected policy is:
 ### macOS
 
 - install binary or shim
-- store secrets in Keychain
+- read Cloudflare R2 credentials from `.codex-handoff/.env.local`
 - register background auto-start with `launchd`
 - store app state under `~/.codex-handoff/`
 - write logs under `~/.codex-handoff/logs/`
@@ -207,7 +206,7 @@ The expected policy is:
 ### Windows
 
 - install binary or shim
-- store secrets with DPAPI
+- read Cloudflare R2 credentials from `.codex-handoff/.env.local`
 - register auto-start with Task Scheduler or Startup task
 - store app state under `~/.codex-handoff/`
 - write logs under `~/.codex-handoff/logs/`
@@ -221,7 +220,7 @@ The install prompt that a user pastes into Codex should be intentionally short. 
 3. Do not stop after package install. The same task must continue into repo setup.
 4. Resolve the target repo path and use `--repo <path>` explicitly when needed.
 5. Run `codex-handoff doctor`.
-6. Run remote login if no valid profile exists.
+6. Ensure `.codex-handoff/.env.local` exists and contains valid R2 credentials.
 7. If the user asked to "sync" the current repo, align the current state first.
 8. When the repo is not attached, use `setup --skip-agent-start --skip-autostart`.
 9. When the repo is already attached, use `sync now`.
@@ -247,7 +246,7 @@ Implemented today:
 - local reader CLI
 - `.codex-handoff` bootstrap model
 - `remote login r2`, `remote whoami`, `remote validate`, `remote logout`
-- macOS Keychain and Windows DPAPI credential strategy
+- repo-local `.codex-handoff/.env.local` credential strategy
 - repo enable/attach metadata and managed `AGENTS.md` block updates
 - local thread discovery plus thread-bundle export/import primitives
 - repo-scoped sync push/pull/now/watch CLI scaffolding

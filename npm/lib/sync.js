@@ -11,6 +11,7 @@ const {
   normalizeCwd,
   normalizeGitOriginUrl,
   readRolloutRecords,
+  readSessionIndexMap,
   repoGitOriginUrl,
   stripWindowsPrefix,
   upsertSessionIndex,
@@ -22,18 +23,22 @@ const {
   currentThreadPath,
   ensureMemoryLayout,
   loadRepoState,
+  relocalizeRepoState,
   loadSyncState,
   materializedRootPaths,
+  saveRepoState,
   saveSyncState,
   syncStatePath,
   threadIndexPath,
 } = require("./workspace");
+const { DEFAULT_REMOTE_AUTH_PATH, DEFAULT_REMOTE_AUTH_TYPE } = require("./repo-auth");
 
 async function exportRepoThreads(repoPath, memoryDir, { codexHome, includeRawThreads = false }) {
   ensureMemoryLayout(memoryDir);
   cleanupLegacyThreadArtifacts(memoryDir);
   cleanupRootHistoryArtifacts(memoryDir);
-  const threads = discoverThreadsForRepo(repoPath, codexHome);
+  const repoState = loadRepoState(memoryDir);
+  const threads = discoverThreadsForRepo(repoPath, codexHome, repoState);
   const indexPayload = [];
   for (const thread of threads) {
     exportThreadBundle(repoPath, memoryDir, thread, { includeRawThreads });
@@ -238,6 +243,9 @@ async function pullMemoryTree(profile, memoryDir, prefix) {
 
 async function pullRepoMemorySnapshot(repoPath, memoryDir, profile, repoState, { codexHome, thread = null } = {}) {
   const downloaded = await pullMemoryTree(profile, memoryDir, repoState.remote_prefix);
+  const pulledRepoState = loadRepoState(memoryDir);
+  const localizedRepoState = relocalizeRepoState(repoPath, pulledRepoState, repoState);
+  saveRepoState(memoryDir, localizedRepoState);
   let threadId = thread;
   if (!threadId && fs.existsSync(currentThreadPath(memoryDir))) {
     threadId = JSON.parse(fs.readFileSync(currentThreadPath(memoryDir), "utf8")).thread_id || null;
@@ -249,7 +257,7 @@ async function pullRepoMemorySnapshot(repoPath, memoryDir, profile, repoState, {
   }
   const syncState = recordSyncEvent(memoryDir, {
     repoPath,
-    prefix: repoState.remote_prefix,
+    prefix: localizedRepoState.remote_prefix,
     direction: "pull",
     command: "pull",
     downloadedObjects: downloaded.length,
@@ -257,10 +265,11 @@ async function pullRepoMemorySnapshot(repoPath, memoryDir, profile, repoState, {
   });
   return {
     repo: repoPath,
-    repo_slug: repoState.repo_slug,
-    remote_profile: repoState.remote_profile,
-    remote_prefix: repoState.remote_prefix,
-    prefix: repoState.remote_prefix,
+    repo_slug: localizedRepoState.repo_slug,
+    remote_auth_type: localizedRepoState.remote_auth_type || DEFAULT_REMOTE_AUTH_TYPE,
+    remote_auth_path: localizedRepoState.remote_auth_path || DEFAULT_REMOTE_AUTH_PATH,
+    remote_prefix: localizedRepoState.remote_prefix,
+    prefix: localizedRepoState.remote_prefix,
     downloaded_objects: downloaded.length,
     imported_thread: imported,
     sync_state_path: syncStatePath(memoryDir),
@@ -400,7 +409,8 @@ async function syncNow(repoPath, memoryDir, profile, { codexHome, includeRawThre
   return {
     repo: repoPath,
     repo_slug: repoState.repo_slug,
-    remote_profile: repoState.remote_profile,
+    remote_auth_type: repoState.remote_auth_type || DEFAULT_REMOTE_AUTH_TYPE,
+    remote_auth_path: repoState.remote_auth_path || DEFAULT_REMOTE_AUTH_PATH,
     remote_prefix: prefix,
     prefix,
     threads_exported: 0,
@@ -414,15 +424,73 @@ async function syncNow(repoPath, memoryDir, profile, { codexHome, includeRawThre
   };
 }
 
-async function syncChangedThreads(repoPath, memoryDir, profile, { codexHome, includeRawThreads = false, prefix, changes = [] }) {
+async function syncChangedThreads(repoPath, memoryDir, profile, { codexHome, includeRawThreads = false, prefix, changes = [], discoverThreads = discoverThreadsForRepo } = {}) {
+  const repoState = loadRepoState(memoryDir);
+  const threadUpdate = applyChangedThreadsLocally(repoPath, memoryDir, {
+    codexHome,
+    includeRawThreads,
+    changes,
+    discoverThreads,
+  });
+  if (!profile) {
+    return buildChangedThreadSyncResult(repoPath, memoryDir, repoState, prefix, threadUpdate, {
+      objectsUploaded: 0,
+      remotePushAttempted: false,
+      remotePushSucceeded: false,
+      remoteError: null,
+    });
+  }
+
+  try {
+    const uploaded = await pushMemoryTree(profile, memoryDir, prefix);
+    const syncState = recordSyncEvent(memoryDir, {
+      repoPath,
+      prefix,
+      direction: "push",
+      command: "watch",
+      threadIds: threadUpdate.thread_ids,
+      currentThread: threadUpdate.current_thread,
+      threadsExported: threadUpdate.threads_exported,
+      objectsUploaded: uploaded.length,
+    });
+    return buildChangedThreadSyncResult(repoPath, memoryDir, loadRepoState(memoryDir), prefix, threadUpdate, {
+      objectsUploaded: uploaded.length,
+      remotePushAttempted: true,
+      remotePushSucceeded: true,
+      remoteError: null,
+      syncState,
+    });
+  } catch (error) {
+    return buildChangedThreadSyncResult(repoPath, memoryDir, loadRepoState(memoryDir), prefix, threadUpdate, {
+      objectsUploaded: 0,
+      remotePushAttempted: true,
+      remotePushSucceeded: false,
+      remoteError: error.message,
+    });
+  }
+}
+
+function applyChangedThreadsLocally(repoPath, memoryDir, { codexHome, includeRawThreads = false, changes = [], discoverThreads = discoverThreadsForRepo } = {}) {
   ensureMemoryLayout(memoryDir);
   cleanupLegacyThreadArtifacts(memoryDir);
   cleanupRootHistoryArtifacts(memoryDir);
+  const repoState = loadRepoState(memoryDir);
+  const paths = codexPaths(codexHome);
+  const sessionIndexMap = readSessionIndexMap(paths.sessionIndexPath);
   const touchedThreadIds = [];
+  const threadMap = new Map(
+    discoverThreads(repoPath, codexHome, repoState).map((thread) => [thread.threadId, thread]),
+  );
 
   for (const change of changes) {
     if (!change?.threadId) continue;
-    const thread = discoverThreadsForRepo(repoPath, codexHome).find((item) => item.threadId === change.threadId);
+    let thread = threadMap.get(change.threadId) || null;
+    if (!thread) {
+      thread = synthesizeThreadFromChange(repoPath, change, sessionIndexMap);
+      if (thread) {
+        threadMap.set(thread.threadId, thread);
+      }
+    }
     if (!thread) continue;
     const result = updateThreadBundleFromRolloutChange(repoPath, memoryDir, thread, {
       newLines: change.newLines,
@@ -440,33 +508,81 @@ async function syncChangedThreads(repoPath, memoryDir, profile, { codexHome, inc
     fs.writeFileSync(currentThreadPath(memoryDir), JSON.stringify({ thread_id: currentThread }, null, 2) + "\n", "utf8");
   }
 
-  const uploaded = await pushMemoryTree(profile, memoryDir, prefix);
   const threadIds = indexPayload.map((item) => item.thread_id).filter(Boolean);
-  const syncState = recordSyncEvent(memoryDir, {
-    repoPath,
-    prefix,
-    direction: "push",
-    command: "watch",
-    threadIds,
-    currentThread,
-    threadsExported: touchedThreadIds.length,
-    objectsUploaded: uploaded.length,
-  });
-  const repoState = loadRepoState(memoryDir);
   return {
-    repo: repoPath,
-    repo_slug: repoState.repo_slug,
-    remote_profile: repoState.remote_profile,
-    remote_prefix: prefix,
-    prefix,
     threads_exported: touchedThreadIds.length,
     thread_count: threadIds.length,
     thread_ids: threadIds,
     current_thread: currentThread,
-    objects_uploaded: uploaded.length,
+  };
+}
+
+function synthesizeThreadFromChange(repoPath, change, sessionIndexMap) {
+  const threadId = typeof change?.threadId === "string" ? change.threadId : null;
+  const rolloutPath = typeof change?.rolloutPath === "string" ? change.rolloutPath : null;
+  if (!threadId || !rolloutPath) {
+    return null;
+  }
+  const sessionIndexEntry = sessionIndexMap.get(threadId) || null;
+  const stat = fs.existsSync(rolloutPath) ? fs.statSync(rolloutPath) : null;
+  const updatedAt = stat
+    ? Math.floor(stat.mtimeMs / 1000)
+    : parseSessionIndexUpdatedAt(sessionIndexEntry?.updated_at) || Math.floor(Date.now() / 1000);
+  const createdAt = stat
+    ? Math.floor((stat.birthtimeMs || stat.mtimeMs) / 1000)
+    : updatedAt;
+  const cwd = typeof change?.cwd === "string" && change.cwd.trim() ? change.cwd : repoPath;
+  const title = sessionIndexEntry?.thread_name || threadId;
+  return {
+    threadId,
+    title,
+    cwd,
+    rolloutPath,
+    createdAt,
+    updatedAt,
+    row: {
+      id: threadId,
+      source: "vscode",
+      model_provider: "openai",
+      cwd,
+      rollout_path: rolloutPath,
+      title,
+    },
+    sessionIndexEntry,
+  };
+}
+
+function parseSessionIndexUpdatedAt(value) {
+  const parsed = Date.parse(String(value || ""));
+  return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : null;
+}
+
+function buildChangedThreadSyncResult(repoPath, memoryDir, repoState, prefix, localResult, {
+  objectsUploaded,
+  remotePushAttempted,
+  remotePushSucceeded,
+  remoteError,
+  syncState = null,
+}) {
+  const state = syncState || loadSyncState(memoryDir);
+  return {
+    repo: repoPath,
+    repo_slug: repoState.repo_slug,
+    remote_auth_type: repoState.remote_auth_type || DEFAULT_REMOTE_AUTH_TYPE,
+    remote_auth_path: repoState.remote_auth_path || DEFAULT_REMOTE_AUTH_PATH,
+    remote_prefix: prefix,
+    prefix,
+    threads_exported: localResult.threads_exported,
+    thread_count: localResult.thread_count,
+    thread_ids: localResult.thread_ids,
+    current_thread: localResult.current_thread,
+    objects_uploaded: objectsUploaded,
+    remote_push_attempted: remotePushAttempted,
+    remote_push_succeeded: remotePushSucceeded,
+    remote_error: remoteError,
     sync_state_path: syncStatePath(memoryDir),
-    sync_state: syncState,
-    sync_health: buildSyncHealth(memoryDir, syncState),
+    sync_state: Object.keys(state).length ? state : null,
+    sync_health: buildSyncHealth(memoryDir, syncState || null),
   };
 }
 
@@ -569,7 +685,8 @@ function recordSyncEvent(memoryDir, { repoPath, prefix, direction, command, thre
     schema_version: "1.0",
     repo: repoPath || repoState.repo_path || "",
     repo_slug: repoState.repo_slug || existing.repo_slug || null,
-    remote_profile: repoState.remote_profile || existing.remote_profile || null,
+    remote_auth_type: repoState.remote_auth_type || existing.remote_auth_type || DEFAULT_REMOTE_AUTH_TYPE,
+    remote_auth_path: repoState.remote_auth_path || existing.remote_auth_path || DEFAULT_REMOTE_AUTH_PATH,
     remote_prefix: prefix || existing.remote_prefix || null,
     last_sync_at: now,
     last_sync_direction: direction,
@@ -647,6 +764,7 @@ function cleanupRootHistoryArtifacts(memoryDir) {
 }
 
 module.exports = {
+  applyChangedThreadsLocally,
   cleanupThread,
   describeSyncState,
   exportRepoThreads,

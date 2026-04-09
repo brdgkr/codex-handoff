@@ -112,7 +112,7 @@ codex-handoff setup
 File-based auth path:
 
 ```bash
-codex-handoff remote login r2 --dotenv ~/.codex-handoff/.env.local
+codex-handoff remote login r2 --dotenv ./.codex-handoff/.env.local
 codex-handoff setup
 ```
 

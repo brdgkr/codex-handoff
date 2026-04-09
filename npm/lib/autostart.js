@@ -3,6 +3,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
+const { withHiddenWindows } = require("./child-process");
 const { configPath, readJsonFile, resolveConfigDir, runtimeDir } = require("../service/common");
 
 const WINDOWS_TASK_NAME = "codex-handoff-agent";
@@ -86,7 +87,7 @@ function enableWindowsAutostart({ codexHome, configDir }) {
     "/TR",
     `wscript.exe //B //NoLogo "${scriptPath}"`,
     "/F",
-  ], { encoding: "utf8" });
+  ], withHiddenWindows({ encoding: "utf8" }));
   if (result.status === 0) {
     const startupPath = startupScriptPath();
     deleteWindowsRunEntry();
@@ -136,7 +137,7 @@ function enableWindowsAutostart({ codexHome, configDir }) {
 
 function disableWindowsAutostart(configDir) {
   cleanupLegacyWindowsAutostart(configDir);
-  const result = spawnSync("schtasks", ["/Delete", "/TN", WINDOWS_TASK_NAME, "/F"], { encoding: "utf8" });
+  const result = spawnSync("schtasks", ["/Delete", "/TN", WINDOWS_TASK_NAME, "/F"], withHiddenWindows({ encoding: "utf8" }));
   const scriptPath = windowsCommandScriptPath(configDir);
   const startupPath = startupScriptPath();
   if (fs.existsSync(scriptPath)) fs.rmSync(scriptPath, { force: true });
@@ -153,7 +154,7 @@ function disableWindowsAutostart(configDir) {
 }
 
 function windowsAutostartStatus(configDir) {
-  const result = spawnSync("schtasks", ["/Query", "/TN", WINDOWS_TASK_NAME], { encoding: "utf8" });
+  const result = spawnSync("schtasks", ["/Query", "/TN", WINDOWS_TASK_NAME], withHiddenWindows({ encoding: "utf8" }));
   const startupPath = startupScriptPath();
   const runEnabled = windowsRunEntryExists();
   return {
@@ -326,8 +327,8 @@ function cleanupLegacyWindowsAutostart(configDir) {
         fs.rmSync(filePath, { force: true });
       }
     }
-    spawnSync("reg", ["delete", windowsRunKeyPath(), "/v", repoSlug, "/f"], { encoding: "utf8" });
-    spawnSync("schtasks", ["/Delete", "/TN", `codex-handoff-${repoSlug}`, "/F"], { encoding: "utf8" });
+    spawnSync("reg", ["delete", windowsRunKeyPath(), "/v", repoSlug, "/f"], withHiddenWindows({ encoding: "utf8" }));
+    spawnSync("schtasks", ["/Delete", "/TN", `codex-handoff-${repoSlug}`, "/F"], withHiddenWindows({ encoding: "utf8" }));
   }
 }
 
@@ -342,7 +343,7 @@ function writeWindowsRunEntry(scriptPath) {
     "/d",
     `wscript.exe //B //NoLogo "${scriptPath}"`,
     "/f",
-  ], { encoding: "utf8" });
+  ], withHiddenWindows({ encoding: "utf8" }));
 }
 
 function deleteWindowsRunEntry() {
@@ -352,10 +353,10 @@ function deleteWindowsRunEntry() {
     "/v",
     WINDOWS_RUN_VALUE,
     "/f",
-  ], { encoding: "utf8" });
+  ], withHiddenWindows({ encoding: "utf8" }));
 }
 
 function windowsRunEntryExists() {
-  const result = spawnSync("reg", ["query", windowsRunKeyPath(), "/v", WINDOWS_RUN_VALUE], { encoding: "utf8" });
+  const result = spawnSync("reg", ["query", windowsRunKeyPath(), "/v", WINDOWS_RUN_VALUE], withHiddenWindows({ encoding: "utf8" }));
   return result.status === 0;
 }

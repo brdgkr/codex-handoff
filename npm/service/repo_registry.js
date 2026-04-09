@@ -2,14 +2,13 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const {
-  configPath,
   isSameOrDescendantPath,
   normalizeComparablePath,
-  readJsonFile,
 } = require("./common");
+const { loadConfig } = require("../lib/runtime-config");
 
 function loadManagedRepos(configDir) {
-  const payload = readJsonFile(configPath(configDir), { repos: {} });
+  const payload = loadConfig(configDir);
   const repos = payload.repos || {};
   return Object.entries(repos)
     .map(([repoPath, repoState]) => {

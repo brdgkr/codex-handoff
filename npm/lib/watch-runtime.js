@@ -2,6 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 
+const { withHiddenWindows } = require("./child-process");
 const { readJsonFile, watchServiceStatePath } = require("../service/common");
 const { findScriptProcessPids, forceTerminateProcess, isProcessRunning, terminateProcess, waitForProcessesExit } = require("./process-utils");
 
@@ -26,6 +27,7 @@ function startWatchService({ configDir, codexHome, cwd = process.cwd() }) {
     cwd,
     detached: true,
     stdio: "ignore",
+    ...withHiddenWindows(),
   });
   child.unref();
   return { command, args, pid: child.pid };

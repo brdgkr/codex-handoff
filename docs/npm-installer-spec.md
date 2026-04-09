@@ -115,6 +115,8 @@ repos/<repo-slug>/
   manifest.json
   thread-index.json
   current-thread.json
+  memory.md
+  memory-state.json
   threads/
     <thread-id>/
       manifest.json
@@ -132,6 +134,8 @@ Where:
 - `manifest.json` records repo identity, known machines, revision markers, and sync metadata
 - `thread-index.json` stores discovered thread metadata
 - `current-thread.json` points to the thread to materialize into the root `.codex-handoff/` view
+- `memory.md` stores compact repo-level memory for new Codex sessions
+- `memory-state.json` records the isolated summarization inputs and update metadata
 - each `threads/<thread-id>/` directory stores the summarized handoff data, normalized Codex-local metadata, and optional original source session
 
 ## Service registration targets

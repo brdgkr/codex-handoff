@@ -19,6 +19,7 @@ const {
   searchRaw,
 } = require("./lib/reader");
 const { cleanupLegacyAuthArtifacts, loadConfig, saveConfig } = require("./lib/runtime-config");
+const { memoryPath, memoryStatePath, summarizeMemoryWithCodex } = require("./lib/memory");
 const { findScriptProcessPids } = require("./lib/process-utils");
 const {
   DEFAULT_REMOTE_AUTH_PATH,
@@ -136,6 +137,10 @@ function main(argv = process.argv.slice(2)) {
 
   if (args.command === "sync") {
     return Promise.resolve(handleSync(args, repoPath, memoryDir, configDir, codexHome));
+  }
+
+  if (args.command === "memory") {
+    return Promise.resolve(handleMemory(args, repoPath, memoryDir));
   }
 
   if (args.command === "skill") {
@@ -546,6 +551,51 @@ async function handleSync(args, repoPath, memoryDir, configDir, codexHome) {
     return 0;
   }
   throw new Error(`Unsupported sync subcommand: ${args.subcommand || ""}`);
+}
+
+async function handleMemory(args, repoPath, memoryDir) {
+  if (args.subcommand === "status") {
+    const filePath = memoryPath(memoryDir);
+    const statePath = memoryStatePath(memoryDir);
+    printJson({
+      repo: repoPath,
+      memory_dir: memoryDir,
+      memory_path: filePath,
+      memory_present: fs.existsSync(filePath),
+      memory_state_path: statePath,
+      memory_state_present: fs.existsSync(statePath),
+    });
+    return 0;
+  }
+  if (args.subcommand === "summarize" || args.subcommand === "update") {
+    const result = summarizeMemoryWithCodex(repoPath, memoryDir, {
+      codexBin: args.codexBin,
+      dryRun: args.dryRun,
+      goal: args.goal || "",
+      keepTemp: args.keepTemp,
+      maxDigestThreads: args.maxDigestThreads,
+      maxThreadBytes: args.maxThreadBytes,
+      maxThreads: args.maxThreads,
+      maxWords: args.maxWords,
+      model: args.model,
+      reasoningEffort: args.reasoningEffort,
+      timeoutMs: args.timeoutMs,
+    });
+    if (args.dryRun) {
+      process.stdout.write(result.summary);
+      return 0;
+    }
+    printJson({
+      repo: repoPath,
+      memory_path: result.memory_path,
+      memory_state_path: result.memory_state_path,
+      wrote_memory: result.wrote_memory,
+      temp_dir: result.temp_dir,
+      input_manifest: result.state.input_manifest,
+    });
+    return 0;
+  }
+  throw new Error(`Unsupported memory subcommand: ${args.subcommand || ""}`);
 }
 
 function handleSkill(args, repoPath) {
@@ -1161,11 +1211,20 @@ function parseArgs(argv) {
     remoteSlug: null,
     repoSlug: null,
     profile: null,
+    codexBin: null,
     codexHome: null,
+    dryRun: false,
     goal: null,
     evidenceLimit: 5,
+    keepTemp: false,
+    maxDigestThreads: 100,
+    maxThreadBytes: 32768,
+    maxThreads: 0,
+    maxWords: 900,
+    model: null,
     output: null,
     query: null,
+    reasoningEffort: "low",
     limit: 8,
     session: null,
     turn: null,
@@ -1184,6 +1243,7 @@ function parseArgs(argv) {
     apply: false,
     detail: false,
     skillsDir: null,
+    timeoutMs: 180000,
   };
   const positional = [];
   for (let i = 0; i < argv.length; i += 1) {
@@ -1201,6 +1261,9 @@ function parseArgs(argv) {
     } else if (arg === "--codex-home") {
       out.codexHome = argv[i + 1];
       i += 1;
+    } else if (arg === "--codex-bin") {
+      out.codexBin = argv[i + 1];
+      i += 1;
     } else if (arg === "--goal") {
       out.goal = argv[i + 1];
       i += 1;
@@ -1212,6 +1275,23 @@ function parseArgs(argv) {
       i += 1;
     } else if (arg === "--limit") {
       out.limit = Number(argv[i + 1]) || 8;
+      i += 1;
+    } else if (arg === "--max-thread-bytes") {
+      out.maxThreadBytes = Number(argv[i + 1]) || 32768;
+      i += 1;
+    } else if (arg === "--max-digest-threads") {
+      out.maxDigestThreads = Number(argv[i + 1]);
+      if (!Number.isInteger(out.maxDigestThreads) || out.maxDigestThreads < 0) out.maxDigestThreads = 100;
+      i += 1;
+    } else if (arg === "--max-threads") {
+      out.maxThreads = Number(argv[i + 1]);
+      if (!Number.isInteger(out.maxThreads) || out.maxThreads < 0) out.maxThreads = 0;
+      i += 1;
+    } else if (arg === "--max-words") {
+      out.maxWords = Number(argv[i + 1]) || 900;
+      i += 1;
+    } else if (arg === "--model") {
+      out.model = argv[i + 1];
       i += 1;
     } else if (arg === "--session") {
       out.session = argv[i + 1];
@@ -1227,6 +1307,12 @@ function parseArgs(argv) {
       i += 1;
     } else if (arg === "--summary-mode") {
       out.summaryMode = argv[i + 1];
+      i += 1;
+    } else if (arg === "--reasoning-effort") {
+      out.reasoningEffort = argv[i + 1];
+      i += 1;
+    } else if (arg === "--timeout-ms") {
+      out.timeoutMs = Number(argv[i + 1]) || 180000;
       i += 1;
     } else if (arg === "--skip-raw-threads") out.includeRawThreads = false;
     else if (arg === "--include-raw-threads") out.includeRawThreads = true;
@@ -1250,6 +1336,8 @@ function parseArgs(argv) {
     else if (arg === "--from-env") out.fromEnv = true;
     else if (arg === "--detail") out.detail = true;
     else if (arg === "--apply") out.apply = true;
+    else if (arg === "--dry-run") out.dryRun = true;
+    else if (arg === "--keep-temp") out.keepTemp = true;
     else if (arg === "--dotenv") {
       out.dotenv = argv[i + 1];
       i += 1;
@@ -1293,10 +1381,12 @@ function printHelp() {
       "  threads scan|export|import|cleanup\n" +
       "  agent start|stop|status|restart|enable|disable\n" +
       "  skill install|status\n" +
+      "  memory status|summarize\n" +
       "  sync status|push|pull|now|watch\n" +
       "Flags:\n" +
       "  --skip-raw-threads      Default behavior: do not export rollout.jsonl.gz archives\n" +
-      "  --include-raw-threads   Opt in to exporting rollout.jsonl.gz archives\n",
+      "  --include-raw-threads   Opt in to exporting rollout.jsonl.gz archives\n" +
+      "  --max-digest-threads N  Max thread summaries in memory summarize digest\n",
   );
 }
 

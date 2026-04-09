@@ -75,6 +75,15 @@ While Codex is open:
 5. the repo-scoped handoff tree is pushed to the configured remote prefix
 6. sync results are recorded in `.codex-handoff/sync-state.json`
 
+When the Codex app/window is no longer detected, the agent performs one final
+producer pass before stopping the watcher:
+
+1. export the repo's deterministic thread bundles again from local Codex state
+2. run isolated AI-assisted memory summarization for `.codex-handoff/memory.md`
+3. write `.codex-handoff/memory-state.json`
+4. push the updated handoff tree to the remote so consumer PCs can read the
+   compact root memory without scanning `.codex-handoff/threads/**`
+
 ## Important Files
 
 ### Local repo files
@@ -83,6 +92,8 @@ While Codex is open:
 - `.codex-handoff/.env.local`
 - `.codex-handoff/thread-index.json`
 - `.codex-handoff/current-thread.json`
+- `.codex-handoff/memory.md`
+- `.codex-handoff/memory-state.json`
 - `.codex-handoff/sync-state.json`
 - `.codex-handoff/threads/*.json`
 

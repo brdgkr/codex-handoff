@@ -63,14 +63,16 @@ Remove codex-handoff from this repository.
 
 ## How It Works
 
-`codex-handoff` keeps three main kinds of state:
+`codex-handoff` keeps four main kinds of state:
 
 - `.codex-handoff/latest.md`
   short bootstrap summary
+- `.codex-handoff/memory.md`
+  compact repo-level memory for new Codex sessions
 - `.codex-handoff/handoff.json`
   structured restore state
-- `.codex-handoff/raw/*.jsonl`
-  searchable raw evidence
+- `.codex-handoff/threads/*.json`
+  detailed thread bundles used only when deeper evidence is needed
 
 Background sync is driven by a global watcher:
 
@@ -78,6 +80,24 @@ Background sync is driven by a global watcher:
 - routes rollout changes to the matching repo using `session_meta.payload.cwd`
 - updates repo thread bundles locally
 - pushes the repo-scoped handoff tree to the configured remote prefix
+
+Repo-level memory flow:
+
+- Producer PC watches Codex rollout changes and extracts deterministic thread
+  bundles under `.codex-handoff/threads/` without using AI.
+- When Codex no longer has an active window, Producer PC performs one final
+  deterministic thread export, then runs AI-assisted memory summarization in an
+  isolated temporary working directory using selected handoff inputs. The
+  summarizer receives a compact deterministic `thread-digest.json` by default,
+  not the full thread bundle set.
+- After validation, the summarizer atomically replaces
+  `.codex-handoff/memory.md`; temporary files are not the synchronized output.
+- Sync pushes `.codex-handoff/memory.md` and related handoff state to the remote.
+- Consumer PC pulls that memory into its local `.codex-handoff/` directory.
+- New Codex sessions should read `.codex-handoff/latest.md` and
+  `.codex-handoff/memory.md` first, and should not scan
+  `.codex-handoff/threads/**` unless a memory source link points to a specific
+  thread or the user asks for deeper evidence.
 
 ## Primary Commands
 
@@ -89,6 +109,8 @@ Background sync is driven by a global watcher:
   inspect local handoff state
 - `resume`
   build a restore pack from local handoff state
+- `memory summarize`
+  update compact repo-level memory in `.codex-handoff/memory.md`
 - `search`
   search raw handoff evidence
 - `sync now`

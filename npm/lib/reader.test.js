@@ -18,6 +18,7 @@ function makeFixtureMemory() {
   const threadsDir = path.join(memoryDir, "threads");
   fs.mkdirSync(threadsDir, { recursive: true });
   fs.writeFileSync(path.join(memoryDir, "latest.md"), "# Current State\n\n- Last assistant message: reader test\n", "utf8");
+  fs.writeFileSync(path.join(memoryDir, "memory.md"), "# Repo Memory\n\n- Durable memory note.\n", "utf8");
   fs.writeFileSync(
     path.join(memoryDir, "handoff.json"),
     JSON.stringify(
@@ -86,11 +87,15 @@ test("renderStatus and renderContextPack include bootstrap and evidence", () => 
   const status = renderStatus(repoDir, memoryDir);
   assert.match(status, /current-thread\.json: missing/);
   assert.match(status, /current thread bundle: present/);
+  assert.match(status, /memory\.md: present/);
+  assert.match(status, /Durable memory note/);
   assert.match(status, /thread files: 1/);
   assert.match(status, /transcript records: 2/);
 
   const pack = renderContextPack(repoDir, memoryDir, "scene-evidence restore context", { evidenceLimit: 5 });
   assert.match(pack, /# Codex Restore Pack/);
+  assert.match(pack, /## Repo Memory/);
+  assert.match(pack, /Durable memory note/);
   assert.match(pack, /Validate restore output/);
   assert.match(pack, /Verify search output/);
   assert.match(pack, /session=sess-1/);

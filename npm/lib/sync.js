@@ -39,28 +39,45 @@ async function exportRepoThreads(repoPath, memoryDir, { codexHome, includeRawThr
   cleanupRootHistoryArtifacts(memoryDir);
   const repoState = loadRepoState(memoryDir);
   const threads = discoverThreadsForRepo(repoPath, codexHome, repoState);
+  const existingIndex = new Map(loadThreadIndex(memoryDir).map((entry) => [entry.thread_id, entry]));
   const indexPayload = [];
+  const exportedThreads = [];
   for (const thread of threads) {
-    exportThreadBundle(repoPath, memoryDir, thread, { includeRawThreads });
-    indexPayload.push({
-      thread_id: thread.threadId,
-      title: thread.title,
-      thread_name: thread.sessionIndexEntry?.thread_name || null,
-      created_at: thread.createdAt,
-      updated_at: thread.updatedAt,
-      source_session_relpath: relativeSessionPath(thread.rolloutPath),
-      bundle_path: path.join("threads", `${thread.threadId}.json`),
-    });
+    const previousEntry = existingIndex.get(thread.threadId) || null;
+    if (thread.rolloutPath && fs.existsSync(thread.rolloutPath)) {
+      exportThreadBundle(repoPath, memoryDir, thread, { includeRawThreads });
+      indexPayload.push(buildThreadIndexEntry(thread, previousEntry));
+      exportedThreads.push(thread);
+      continue;
+    }
+    if (loadThreadTranscript(memoryDir, thread.threadId)) {
+      indexPayload.push(buildThreadIndexEntry(thread, previousEntry, { preserveSourceRelpath: true }));
+      exportedThreads.push(thread);
+    }
   }
 
   saveThreadIndex(memoryDir, indexPayload);
-  if (threads.length) {
-    fs.writeFileSync(currentThreadPath(memoryDir), JSON.stringify({ thread_id: threads[0].threadId }, null, 2) + "\n", "utf8");
-    materializeRootFromThread(memoryDir, threads[0].threadId);
+  if (exportedThreads.length) {
+    fs.writeFileSync(currentThreadPath(memoryDir), JSON.stringify({ thread_id: exportedThreads[0].threadId }, null, 2) + "\n", "utf8");
+    materializeRootFromThread(memoryDir, exportedThreads[0].threadId);
   } else {
     clearMaterializedRoot(memoryDir);
   }
-  return threads;
+  return exportedThreads;
+}
+
+function buildThreadIndexEntry(thread, previousEntry = null, { preserveSourceRelpath = false } = {}) {
+  return {
+    thread_id: thread.threadId,
+    title: thread.title || previousEntry?.title || thread.threadId,
+    thread_name: thread.sessionIndexEntry?.thread_name || previousEntry?.thread_name || null,
+    created_at: thread.createdAt ?? previousEntry?.created_at ?? null,
+    updated_at: thread.updatedAt ?? previousEntry?.updated_at ?? null,
+    source_session_relpath: preserveSourceRelpath
+      ? (previousEntry?.source_session_relpath || relativeSessionPath(thread.rolloutPath || ""))
+      : relativeSessionPath(thread.rolloutPath || ""),
+    bundle_path: path.join("threads", `${thread.threadId}.json`),
+  };
 }
 
 function exportThreadBundle(repoPath, memoryDir, thread, { includeRawThreads = false }) {
@@ -635,6 +652,7 @@ function materializedRootStatus(memoryDir) {
   return {
     current_thread_present: fs.existsSync(currentPath),
     thread_index_present: fs.existsSync(indexPath),
+    memory_present: fs.existsSync(path.join(memoryDir, "memory.md")),
   };
 }
 
@@ -648,7 +666,7 @@ function buildSyncHealth(memoryDir, syncState = null) {
     status = "ok";
     if (threadIds.length && !currentThread) status = "current_thread_missing";
     else if (currentThread && !threadIds.includes(currentThread)) status = "current_thread_missing";
-    else if (currentThread && !Object.values(rootStatus).every(Boolean)) status = "materialized_root_incomplete";
+    else if (currentThread && (!rootStatus.current_thread_present || !rootStatus.thread_index_present)) status = "materialized_root_incomplete";
   }
   return {
     status,
@@ -707,6 +725,8 @@ function recordSyncEvent(memoryDir, { repoPath, prefix, direction, command, thre
 function shouldSyncRelpath(relPath, threadIds, currentThreadIdValue) {
   if (relPath === "repo.json") return true;
   if (relPath === "thread-index.json") return true;
+  if (relPath === "memory.md") return true;
+  if (relPath === "memory-state.json") return true;
   if (relPath === "current-thread.json") return currentThreadIdValue && threadIds.includes(currentThreadIdValue);
   const parts = relPath.split("/");
   if (parts.length === 2 && parts[0] === "threads") {
@@ -776,4 +796,7 @@ module.exports = {
   updateThreadBundleFromRolloutChange,
   syncChangedThreads,
   syncNow,
+  _test: {
+    shouldSyncRelpath,
+  },
 };

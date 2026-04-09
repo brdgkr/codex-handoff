@@ -53,6 +53,19 @@ Inspect repo state, sync state, runtime state, and local prerequisites.
 
 Inspect sync health for the current repo.
 
+### `codex-handoff memory status`
+
+Inspect the root repo-level memory artifact.
+
+### `codex-handoff memory summarize`
+
+Run isolated AI-assisted summarization and atomically update
+`.codex-handoff/memory.md`.
+
+By default this passes a compact deterministic `thread-digest.json` into the
+isolated summarizer and does not copy full thread bundles. Use
+`--max-threads <n>` only when deeper evidence is needed.
+
 ### `codex-handoff agent status`
 
 Inspect background agent and watcher state.

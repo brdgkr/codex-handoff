@@ -20,6 +20,10 @@ function handoffPath(memoryDir) {
   return path.join(memoryDir, "handoff.json");
 }
 
+function memoryPath(memoryDir) {
+  return path.join(memoryDir, "memory.md");
+}
+
 function currentThreadPath(memoryDir) {
   return path.join(memoryDir, "current-thread.json");
 }
@@ -44,6 +48,11 @@ function readHandoff(memoryDir) {
   }
   const filePath = handoffPath(memoryDir);
   return fs.existsSync(filePath) ? JSON.parse(fs.readFileSync(filePath, "utf8")) : {};
+}
+
+function readMemory(memoryDir) {
+  const filePath = memoryPath(memoryDir);
+  return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8").trim() : "";
 }
 
 function* iterTranscriptRecords(memoryDir) {
@@ -217,6 +226,7 @@ function buildContextQuery(goal, handoff) {
 
 function renderStatus(repoPath, memoryDir) {
   const latestText = readLatest(memoryDir);
+  const memoryText = readMemory(memoryDir);
   const handoff = readHandoff(memoryDir);
   const currentThreadExists = fs.existsSync(currentThreadPath(memoryDir));
   const lines = [
@@ -229,11 +239,15 @@ function renderStatus(repoPath, memoryDir) {
     "## Files",
     `- current-thread.json: ${currentThreadExists ? "present" : "missing"}`,
     `- current thread bundle: ${latestText || Object.keys(handoff).length ? "present" : "missing"}`,
+    `- memory.md: ${memoryText ? "present" : "missing"}`,
     `- thread files: ${countThreadFiles(memoryDir)}`,
     `- transcript records: ${countTranscriptRecords(memoryDir)}`,
   ];
   if (latestText) {
     lines.push("", "## Bootstrap Summary", latestText);
+  }
+  if (memoryText) {
+    lines.push("", "## Repo Memory", memoryText);
   }
   if (Object.keys(handoff).length) {
     lines.push(
@@ -250,6 +264,7 @@ function renderStatus(repoPath, memoryDir) {
 
 function renderContextPack(repoPath, memoryDir, goal, { evidenceLimit = 5 } = {}) {
   const latest = readLatest(memoryDir);
+  const memory = readMemory(memoryDir);
   const handoff = readHandoff(memoryDir);
   const evidence = searchRaw(memoryDir, buildContextQuery(goal, handoff), evidenceLimit);
   const lines = [
@@ -261,6 +276,9 @@ function renderContextPack(repoPath, memoryDir, goal, { evidenceLimit = 5 } = {}
     "",
     "## Bootstrap",
     latest || "_missing latest.md_",
+    "",
+    "## Repo Memory",
+    memory || "_missing memory.md_",
     "",
     "## Structured State",
     `- current_goal: ${handoff.current_goal || ""}`,
@@ -355,6 +373,7 @@ module.exports = {
   extractRecords,
   readHandoff,
   readLatest,
+  readMemory,
   renderContextPack,
   renderExtractResults,
   renderSearchResults,

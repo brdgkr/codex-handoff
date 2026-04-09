@@ -2,6 +2,7 @@ class AgentController {
   constructor({
     detectCodexProcesses,
     performStartupSync,
+    performShutdownSync,
     activateWatcher,
     deactivateWatcher,
     recordEvent,
@@ -10,6 +11,7 @@ class AgentController {
   }) {
     this.detectCodexProcesses = detectCodexProcesses;
     this.performStartupSync = performStartupSync;
+    this.performShutdownSync = performShutdownSync || (async () => ({ skipped: true }));
     this.activateWatcher = activateWatcher;
     this.deactivateWatcher = deactivateWatcher;
     this.recordEvent = recordEvent || (async () => {});
@@ -100,12 +102,33 @@ class AgentController {
       await this.stopWatching();
       this.watcher = null;
     }
+    let shutdownSync = null;
+    await this.enterSyncingState({
+      phase: "finalizing",
+      codex_processes: [],
+      watcher: null,
+      codex_running: false,
+    });
+    try {
+      this.logger("starting shutdown sync");
+      shutdownSync = await this.performShutdownSync();
+      this.logger("shutdown sync finished");
+      await this.recordEvent("shutdown_sync_completed", {
+        synced_repo_count: shutdownSync?.synced_repo_count || 0,
+        error_count: Array.isArray(shutdownSync?.errors) ? shutdownSync.errors.length : 0,
+      });
+    } catch (error) {
+      shutdownSync = { error: error.message };
+      this.logger(`shutdown sync error: ${error.stack || error.message}`);
+      await this.recordEvent("shutdown_sync_error", { error: error.message });
+    }
     this.codexRunning = false;
     await this.enterIdleState({
       phase: "idle",
       codex_processes: [],
       watcher: null,
       codex_running: false,
+      last_shutdown_sync: shutdownSync,
     });
   }
 

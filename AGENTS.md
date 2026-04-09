@@ -23,14 +23,17 @@ When working here, optimize for:
 Before doing substantive work in this repository:
 
 1. Read `.codex-handoff/latest.md` first if it exists.
-2. If the user asks to continue previous work, run:
+2. Read `.codex-handoff/memory.md` if it exists; it is the compact repo-level
+   memory intended for new Codex sessions.
+3. If the user asks to continue previous work, run:
    `codex-handoff --repo . resume --goal "<user-goal>"`
-3. If the bootstrap summary is insufficient, inspect:
+4. If the bootstrap summary is insufficient, inspect:
    `.codex-handoff/handoff.json`
-4. Never load raw session jsonl files wholesale. Use:
-   `codex-handoff search`
-   `codex-handoff extract`
-   `codex-handoff context-pack`
+5. Never enumerate or bulk-read `.codex-handoff/threads/**` or raw session
+   jsonl files. Use targeted commands instead:
+   `codex-handoff --repo . search`
+   `codex-handoff --repo . extract`
+   `codex-handoff --repo . context-pack`
 
 ## Development Rules
 
@@ -40,8 +43,8 @@ Before doing substantive work in this repository:
 - Treat `codex-handoff receive` as the cross-machine restore command.
 - Keep package install behavior and repo setup behavior clearly separated in docs and code.
 - During development before npm publish, verify packaging with:
-  `npm pack`
-  `npm install -g ./brdgkr-codex-handoff-<version>.tgz`
+  `TARBALL=$(npm pack --silent)`
+  `npm install -g "./$TARBALL"`
 - Keep runtime lifecycle safe during npm install and upgrade:
   package install should stop running agent/watch processes before replacing files
   and restart the agent automatically afterward when needed.
@@ -74,7 +77,8 @@ This repository is attached to codex-handoff sync.
 Before doing substantive work in this repository:
 0. If the local `codex-handoff` skill is installed, use it for sync, pull, import, and resume orchestration.
 1. Read `.codex-handoff/latest.md` first if it exists.
-2. If the user asks to continue previous work, run `codex-handoff --repo . resume --goal "<user-goal>"`.
-3. If the bootstrap summary is insufficient, inspect `.codex-handoff/handoff.json`.
-4. Never load raw session jsonl files wholesale. Use `codex-handoff --repo . search`, `codex-handoff --repo . extract`, or `codex-handoff --repo . context-pack` to retrieve only relevant evidence.
+2. Read `.codex-handoff/memory.md` if it exists; it is the compact repo-level memory intended for new Codex sessions.
+3. If the user asks to continue previous work, run `codex-handoff --repo . resume --goal "<user-goal>"`.
+4. If the bootstrap summary is insufficient, inspect `.codex-handoff/handoff.json`.
+5. Never enumerate or bulk-read `.codex-handoff/threads/**` or raw session jsonl files. Only inspect a specific thread bundle when `.codex-handoff/memory.md`, `handoff.json`, or a user request points to that exact thread.
 <!-- codex-handoff:end -->

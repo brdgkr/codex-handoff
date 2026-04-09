@@ -124,6 +124,8 @@ repos/<repo-slug>/
   manifest.json
   thread-index.json
   current-thread.json
+  memory.md
+  memory-state.json
   threads/
     <thread-id>/
       manifest.json
@@ -141,6 +143,8 @@ Where:
 - `manifest.json` stores repo-level metadata and sync revision info
 - `thread-index.json` lists known threads for the repo
 - `current-thread.json` points to the thread that should be materialized after pull
+- `memory.md` stores compact repo-level memory intended for default consumer reads
+- `memory-state.json` records summarization inputs and update metadata
 
 ## Attach and scan model
 

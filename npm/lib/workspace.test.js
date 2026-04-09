@@ -5,7 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 
-const { buildRepoState, relocalizeRepoState, removeAgentsBlock, removeMemoryDirGitignoreEntry, unregisterRepoMapping } = require("./workspace");
+const { buildRepoState, ensureAgentsBlock, relocalizeRepoState, removeAgentsBlock, removeMemoryDirGitignoreEntry, unregisterRepoMapping } = require("./workspace");
 
 function runGit(repoDir, ...args) {
   execFileSync("git", args, {
@@ -106,6 +106,20 @@ test("removeAgentsBlock strips the managed block and preserves user content", ()
   assert.equal(result.removed, true);
   assert.match(fs.readFileSync(agentsPath, "utf8"), /# Local instructions/);
   assert.doesNotMatch(fs.readFileSync(agentsPath, "utf8"), /codex-handoff:start/);
+});
+
+test("ensureAgentsBlock points consumers to root memory and away from thread scans", () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-agents-memory-"));
+  const repoState = buildRepoState(repoDir, {
+    machineId: "machine-1",
+    remoteSlug: "project",
+  });
+
+  const agentsPath = ensureAgentsBlock(repoDir, repoState);
+  const content = fs.readFileSync(agentsPath, "utf8");
+
+  assert.match(content, /Read `.codex-handoff\/memory\.md`/);
+  assert.match(content, /Never enumerate or bulk-read `.codex-handoff\/threads\/\*\*`/);
 });
 
 test("removeMemoryDirGitignoreEntry removes the codex-handoff entry", () => {

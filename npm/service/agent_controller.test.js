@@ -45,10 +45,15 @@ test("AgentController syncs all repos and starts watcher when Codex appears", as
 test("AgentController stops watcher when Codex disappears", async () => {
   const states = [];
   let stopCalls = 0;
+  let shutdownSyncCalls = 0;
 
   const controller = new AgentController({
     detectCodexProcesses: async () => [{ pid: 101, name: "codex.exe" }],
     performStartupSync: async () => ({ synced_repo_count: 0 }),
+    performShutdownSync: async () => {
+      shutdownSyncCalls += 1;
+      return { synced_repo_count: 1 };
+    },
     activateWatcher: async () => ({ pid: 999 }),
     deactivateWatcher: async () => {
       stopCalls += 1;
@@ -68,7 +73,9 @@ test("AgentController stops watcher when Codex disappears", async () => {
   await controller.tick();
 
   assert.equal(stopCalls, 1);
+  assert.equal(shutdownSyncCalls, 1);
   assert.equal(controller.codexRunning, false);
   assert.equal(controller.watcher, null);
   assert.equal(states.at(-1).phase, "idle");
+  assert.deepEqual(states.at(-1).last_shutdown_sync, { synced_repo_count: 1 });
 });

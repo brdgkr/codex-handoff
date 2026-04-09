@@ -6,7 +6,7 @@ const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 
 const { dbCwd, dbRolloutPath, discoverThreadsForRepo, upsertThreadRow } = require("./local-codex");
-const { applyChangedThreadsLocally, syncChangedThreads, updateThreadBundleFromRolloutChange } = require("./sync");
+const { applyChangedThreadsLocally, exportRepoThreads, syncChangedThreads, updateThreadBundleFromRolloutChange, _test } = require("./sync");
 
 function makeThread(overrides = {}) {
   return {
@@ -41,10 +41,10 @@ function runGit(repoDir, ...args) {
   });
 }
 
-function seedThread(stateDbPath, repoDir, { id, gitOriginUrl = null, updatedAt = 2 }) {
+function seedThread(stateDbPath, repoDir, { id, gitOriginUrl = null, updatedAt = 2, rolloutPath = path.join(repoDir, `${id}.jsonl`) }) {
   upsertThreadRow(stateDbPath, {
     id,
-    rollout_path: dbRolloutPath(path.join(repoDir, `${id}.jsonl`)),
+    rollout_path: dbRolloutPath(rolloutPath),
     created_at: 1,
     updated_at: updatedAt,
     source: "vscode",
@@ -102,6 +102,60 @@ test("updateThreadBundleFromRolloutChange creates a bundle from appended canonic
     ],
   );
   assert.equal(fs.existsSync(path.join(memoryDir, "threads", "thread-123.json")), true);
+});
+
+test("exportRepoThreads preserves imported bundles when raw rollout files are unavailable", async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-export-missing-rollout-repo-"));
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-export-missing-rollout-home-"));
+  const memoryDir = path.join(repoDir, ".codex-handoff");
+  const stateDbPath = path.join(codexHome, "state_5.sqlite");
+  const rolloutDir = path.join(codexHome, "sessions", "2026", "04", "09");
+  const liveRolloutPath = path.join(rolloutDir, "rollout-live.jsonl");
+  const missingRolloutPath = path.join(codexHome, "sessions", "missing-rollout.jsonl");
+
+  fs.mkdirSync(path.join(memoryDir, "threads"), { recursive: true });
+  fs.mkdirSync(rolloutDir, { recursive: true });
+  fs.writeFileSync(liveRolloutPath, [
+    JSON.stringify({ type: "session_meta", payload: { id: "thread-live", cwd: repoDir } }),
+    JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "live user" } }),
+    "",
+  ].join("\n"), "utf8");
+  fs.writeFileSync(path.join(memoryDir, "threads", "thread-imported.json"), JSON.stringify([
+    {
+      session_id: "thread-imported",
+      turn_id: "turn-1",
+      timestamp: null,
+      role: "user",
+      phase: null,
+      message: "imported user",
+    },
+  ], null, 2) + "\n", "utf8");
+  fs.writeFileSync(path.join(memoryDir, "thread-index.json"), JSON.stringify([
+    {
+      thread_id: "thread-imported",
+      title: "Imported Thread",
+      thread_name: "Imported Thread",
+      created_at: 1,
+      updated_at: 4,
+      source_session_relpath: "sessions/original-imported.jsonl",
+      bundle_path: "threads/thread-imported.json",
+    },
+  ], null, 2) + "\n", "utf8");
+
+  seedThread(stateDbPath, repoDir, { id: "thread-imported", updatedAt: 4, rolloutPath: missingRolloutPath });
+  seedThread(stateDbPath, repoDir, { id: "thread-live", updatedAt: 3, rolloutPath: liveRolloutPath });
+
+  const exported = await exportRepoThreads(repoDir, memoryDir, {
+    codexHome,
+    includeRawThreads: false,
+  });
+
+  assert.deepEqual(exported.map((thread) => thread.threadId), ["thread-imported", "thread-live"]);
+  const index = JSON.parse(fs.readFileSync(path.join(memoryDir, "thread-index.json"), "utf8"));
+  assert.deepEqual(index.map((entry) => entry.thread_id), ["thread-imported", "thread-live"]);
+  assert.equal(index[0].source_session_relpath, "sessions/original-imported.jsonl");
+  const importedTranscript = JSON.parse(fs.readFileSync(path.join(memoryDir, "threads", "thread-imported.json"), "utf8"));
+  assert.equal(importedTranscript[0].message, "imported user");
 });
 
 test("updateThreadBundleFromRolloutChange ignores noise-only appended lines for new threads", () => {
@@ -287,4 +341,11 @@ test("syncChangedThreads keeps local thread updates when remote push is unavaila
   assert.equal(result.remote_push_succeeded, false);
   assert.equal(result.threads_exported, 1);
   assert.equal(fs.existsSync(path.join(memoryDir, "threads", "thread-123.json")), true);
+});
+
+test("sync file filter includes root memory artifacts", () => {
+  assert.equal(_test.shouldSyncRelpath("memory.md", [], null), true);
+  assert.equal(_test.shouldSyncRelpath("memory-state.json", [], null), true);
+  assert.equal(_test.shouldSyncRelpath("threads/thread-1.json", ["thread-1"], "thread-1"), true);
+  assert.equal(_test.shouldSyncRelpath("threads/thread-2.json", ["thread-1"], "thread-1"), false);
 });

@@ -6,8 +6,9 @@ const process = require("node:process");
 
 const { serviceState, clearServiceState } = require("../lib/agent-runtime");
 const { detectCodexProcesses, findScriptProcessPids } = require("../lib/process-utils");
+const { summarizeMemoryWithCodex } = require("../lib/memory");
 const { loadRepoR2Profile } = require("../lib/repo-auth");
-const { pullRepoMemorySnapshot } = require("../lib/sync");
+const { exportRepoThreads, pullRepoMemorySnapshot, syncNow } = require("../lib/sync");
 const { watchServiceState, isWatchServiceRunning, startWatchService, stopWatchService } = require("../lib/watch-runtime");
 const { loadRepoState } = require("../lib/workspace");
 const { AgentController } = require("./agent_controller");
@@ -157,6 +158,7 @@ async function main() {
       };
     },
     performStartupSync: async () => runStartupSync(options.configDir, options.codexHome, logger),
+    performShutdownSync: async () => runShutdownSync(options.configDir, options.codexHome, logger),
     writeState: async (payload) => {
       writeState(options.configDir, payload);
     },
@@ -277,6 +279,91 @@ async function runStartupSync(configDir, codexHome, logger) {
 
   const completedAt = new Date().toISOString();
   recordManagedRepoEvent(configDir, "startup_sync_completed", {
+    completed_at: completedAt,
+    managed_repo_count: managedRepos.length,
+    synced_repo_count: syncedRepos.length,
+    skipped_repo_count: skippedRepoCount,
+    error_count: errors.length,
+  });
+  return {
+    synced_repo_count: syncedRepos.length,
+    skipped_repo_count: skippedRepoCount,
+    synced_repos: syncedRepos,
+    errors,
+    completed_at: completedAt,
+  };
+}
+
+async function runShutdownSync(configDir, codexHome, logger) {
+  const managedRepos = loadManagedRepos(configDir).filter((repo) => fs.existsSync(repo.repoPath));
+  const startedAt = new Date().toISOString();
+  logger.write(`shutdown sync invoked for codex_home=${codexHome}`);
+  recordManagedRepoEvent(configDir, "shutdown_sync_started", {
+    started_at: startedAt,
+    codex_home: codexHome,
+    managed_repo_count: managedRepos.length,
+  });
+  const syncedRepos = [];
+  const errors = [];
+  let skippedRepoCount = 0;
+
+  for (const repo of managedRepos) {
+    const memoryDir = path.join(repo.repoPath, ".codex-handoff");
+    const repoState = loadRepoState(memoryDir);
+    if (!repoState?.repo_slug || !repoState?.remote_prefix) {
+      skippedRepoCount += 1;
+      recordManagedRepoEvent(configDir, "shutdown_sync_repo", {
+        repo: repo.repoPath,
+        repo_slug: repo.repoSlug,
+        status: "skipped",
+        reason: "missing_repo_state",
+      }, [repo.repoPath]);
+      continue;
+    }
+    try {
+      const threads = await exportRepoThreads(repo.repoPath, memoryDir, {
+        codexHome,
+        includeRawThreads: repoState.include_raw_threads === true,
+      });
+      const memoryResult = summarizeMemoryWithCodex(repo.repoPath, memoryDir, {
+        goal: "Update compact repo-level memory after the Codex window closed.",
+        maxThreads: 0,
+        maxWords: 900,
+        reasoningEffort: "low",
+        timeoutMs: 180000,
+      });
+      const profile = loadRepoR2Profile(memoryDir);
+      const pushResult = await syncNow(repo.repoPath, memoryDir, profile, {
+        codexHome,
+        includeRawThreads: repoState.include_raw_threads === true,
+        prefix: repoState.remote_prefix,
+      });
+      const entry = {
+        repo: repo.repoPath,
+        repo_slug: repo.repoSlug,
+        status: "pushed",
+        thread_count: threads.length,
+        memory_written: memoryResult.wrote_memory === true,
+        objects_uploaded: pushResult.objects_uploaded || 0,
+        current_thread: pushResult.current_thread || null,
+      };
+      syncedRepos.push(entry);
+      recordManagedRepoEvent(configDir, "shutdown_sync_repo", entry, [repo.repoPath]);
+    } catch (error) {
+      logger.write(`shutdown sync error ${repo.repoPath}: ${error.message}`);
+      const entry = {
+        repo: repo.repoPath,
+        repo_slug: repo.repoSlug,
+        status: "error",
+        error: error.message,
+      };
+      errors.push(entry);
+      recordManagedRepoEvent(configDir, "shutdown_sync_repo", entry, [repo.repoPath]);
+    }
+  }
+
+  const completedAt = new Date().toISOString();
+  recordManagedRepoEvent(configDir, "shutdown_sync_completed", {
     completed_at: completedAt,
     managed_repo_count: managedRepos.length,
     synced_repo_count: syncedRepos.length,

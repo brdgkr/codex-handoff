@@ -1,6 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { summarizeTranscriptBundle } = require("./summarize");
+const { listThreadBundleFiles, readTranscriptFile, resolveThreadBundlePath } = require("./thread-bundles");
 
 const DEFAULT_MEMORY_DIRNAME = ".codex-handoff";
 
@@ -60,8 +61,8 @@ function* iterTranscriptRecords(memoryDir) {
   if (!fs.existsSync(directory)) {
     return;
   }
-  for (const filePath of threadBundleFiles(directory)) {
-    const transcript = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  for (const filePath of listThreadBundleFiles(memoryDir)) {
+    const transcript = readTranscriptFile(filePath);
     const rows = Array.isArray(transcript) ? transcript : [];
     for (let index = 0; index < rows.length; index += 1) {
       const record = rows[index];
@@ -81,14 +82,6 @@ function* iterTranscriptRecords(memoryDir) {
   }
 }
 
-function threadBundleFiles(directory) {
-  return fs
-    .readdirSync(directory, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
-    .map((entry) => path.join(directory, entry.name))
-    .sort();
-}
-
 function readCurrentThreadBundle(memoryDir) {
   const currentPath = currentThreadPath(memoryDir);
   if (!fs.existsSync(currentPath)) {
@@ -100,11 +93,11 @@ function readCurrentThreadBundle(memoryDir) {
     if (!threadId) {
       return null;
     }
-    const bundlePath = path.join(threadsDir(memoryDir), `${threadId}.json`);
+    const bundlePath = resolveThreadBundlePath(memoryDir, threadId);
     if (!fs.existsSync(bundlePath)) {
       return null;
     }
-    const transcript = JSON.parse(fs.readFileSync(bundlePath, "utf8"));
+    const transcript = readTranscriptFile(bundlePath);
     const indexEntries = JSON.parse(fs.readFileSync(path.join(memoryDir, "thread-index.json"), "utf8"));
     const indexEntry = Array.isArray(indexEntries) ? indexEntries.find((item) => item.thread_id === threadId) : null;
     return {
@@ -199,8 +192,7 @@ function extractRecords(memoryDir, { sessionId = null, turnId = null } = {}) {
 }
 
 function countThreadFiles(memoryDir) {
-  const directory = threadsDir(memoryDir);
-  return fs.existsSync(directory) ? threadBundleFiles(directory).length : 0;
+  return listThreadBundleFiles(memoryDir).length;
 }
 
 function countTranscriptRecords(memoryDir) {

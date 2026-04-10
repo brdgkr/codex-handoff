@@ -2,6 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const zlib = require("node:zlib");
 
+const { writeBufferIfChanged, writeJsonFileIfChanged } = require("./file-ops");
 const {
   cleanupThread,
   codexPaths,
@@ -19,6 +20,16 @@ const {
 } = require("./local-codex");
 const { deleteR2Object, getR2Object, listR2Objects, putR2Object } = require("./r2");
 const { extractCanonicalMessages, summarizeRollout } = require("./summarize");
+const {
+  appendThreadTranscript,
+  canonicalThreadBundleRelPath,
+  loadThreadTranscript,
+  readTranscriptFile,
+  resolveThreadBundlePath,
+  resolveThreadBundleRelPath,
+  transcriptMessageKey,
+  writeThreadTranscript,
+} = require("./thread-bundles");
 const {
   currentThreadPath,
   ensureMemoryLayout,
@@ -45,20 +56,23 @@ async function exportRepoThreads(repoPath, memoryDir, { codexHome, includeRawThr
   for (const thread of threads) {
     const previousEntry = existingIndex.get(thread.threadId) || null;
     if (thread.rolloutPath && fs.existsSync(thread.rolloutPath)) {
-      exportThreadBundle(repoPath, memoryDir, thread, { includeRawThreads });
-      indexPayload.push(buildThreadIndexEntry(thread, previousEntry));
+      const exportResult = exportThreadBundle(repoPath, memoryDir, thread, { includeRawThreads });
+      indexPayload.push(buildThreadIndexEntry(thread, previousEntry, { bundleRelPath: exportResult.bundleRelPath }));
       exportedThreads.push(thread);
       continue;
     }
-    if (loadThreadTranscript(memoryDir, thread.threadId)) {
-      indexPayload.push(buildThreadIndexEntry(thread, previousEntry, { preserveSourceRelpath: true }));
+    if (loadThreadTranscript(memoryDir, thread.threadId, previousEntry?.bundle_path || null)) {
+      indexPayload.push(buildThreadIndexEntry(thread, previousEntry, {
+        preserveSourceRelpath: true,
+        bundleRelPath: resolveThreadBundleRelPath(memoryDir, thread.threadId, previousEntry?.bundle_path || null),
+      }));
       exportedThreads.push(thread);
     }
   }
 
   saveThreadIndex(memoryDir, indexPayload);
   if (exportedThreads.length) {
-    fs.writeFileSync(currentThreadPath(memoryDir), JSON.stringify({ thread_id: exportedThreads[0].threadId }, null, 2) + "\n", "utf8");
+    writeCurrentThread(memoryDir, exportedThreads[0].threadId);
     materializeRootFromThread(memoryDir, exportedThreads[0].threadId);
   } else {
     clearMaterializedRoot(memoryDir);
@@ -66,7 +80,7 @@ async function exportRepoThreads(repoPath, memoryDir, { codexHome, includeRawThr
   return exportedThreads;
 }
 
-function buildThreadIndexEntry(thread, previousEntry = null, { preserveSourceRelpath = false } = {}) {
+function buildThreadIndexEntry(thread, previousEntry = null, { preserveSourceRelpath = false, bundleRelPath = null } = {}) {
   return {
     thread_id: thread.threadId,
     title: thread.title || previousEntry?.title || thread.threadId,
@@ -76,44 +90,33 @@ function buildThreadIndexEntry(thread, previousEntry = null, { preserveSourceRel
     source_session_relpath: preserveSourceRelpath
       ? (previousEntry?.source_session_relpath || relativeSessionPath(thread.rolloutPath || ""))
       : relativeSessionPath(thread.rolloutPath || ""),
-    bundle_path: path.join("threads", `${thread.threadId}.json`),
+    bundle_path: bundleRelPath || previousEntry?.bundle_path || canonicalThreadBundleRelPath(thread.threadId),
   };
 }
 
 function exportThreadBundle(repoPath, memoryDir, thread, { includeRawThreads = false }) {
-  const threadsDir = path.join(memoryDir, "threads");
-  fs.mkdirSync(threadsDir, { recursive: true });
-  const bundlePath = path.join(threadsDir, `${thread.threadId}.json`);
-  const sourceArchivePath = path.join(threadsDir, `${thread.threadId}.rollout.jsonl.gz`);
+  const sourceArchivePath = path.join(memoryDir, "threads", `${thread.threadId}.rollout.jsonl.gz`);
 
   const rolloutRecords = readRolloutRecords(thread.rolloutPath);
   const summary = summarizeRollout(repoPath, thread, rolloutRecords);
-  saveThreadTranscript(memoryDir, thread.threadId, summary.rawRecords);
+  const bundleResult = writeThreadTranscript(memoryDir, thread.threadId, summary.rawRecords);
+  const changedPaths = [bundleResult.relPath, ...bundleResult.removedPaths];
 
   if (includeRawThreads) {
     const payload = fs.readFileSync(thread.rolloutPath);
-    fs.writeFileSync(sourceArchivePath, zlib.gzipSync(payload));
+    if (writeBufferIfChanged(sourceArchivePath, zlib.gzipSync(payload))) {
+      changedPaths.push(path.posix.join("threads", `${thread.threadId}.rollout.jsonl.gz`));
+    }
   } else if (fs.existsSync(sourceArchivePath)) {
     fs.rmSync(sourceArchivePath, { force: true });
+    changedPaths.push(path.posix.join("threads", `${thread.threadId}.rollout.jsonl.gz`));
   }
 
-  return bundlePath;
-}
-
-function loadThreadTranscript(memoryDir, threadId) {
-  const bundlePath = path.join(memoryDir, "threads", `${threadId}.json`);
-  if (!fs.existsSync(bundlePath)) {
-    return null;
-  }
-  return JSON.parse(fs.readFileSync(bundlePath, "utf8"));
-}
-
-function saveThreadTranscript(memoryDir, threadId, transcript) {
-  const threadsDir = path.join(memoryDir, "threads");
-  fs.mkdirSync(threadsDir, { recursive: true });
-  const bundlePath = path.join(threadsDir, `${threadId}.json`);
-  fs.writeFileSync(bundlePath, JSON.stringify(transcript, null, 2) + "\n", "utf8");
-  return bundlePath;
+  return {
+    bundlePath: bundleResult.filePath,
+    bundleRelPath: bundleResult.relPath,
+    changedPaths,
+  };
 }
 
 function updateThreadBundleFromRolloutChange(repoPath, memoryDir, thread, { newLines, parserState, includeRawThreads = false }) {
@@ -131,36 +134,73 @@ function updateThreadBundleFromRolloutChange(repoPath, memoryDir, thread, { newL
 
   const existingTranscript = loadThreadTranscript(memoryDir, thread.threadId);
   const transcript = Array.isArray(existingTranscript) ? [...existingTranscript] : [];
-  const seen = new Set(
-    transcript.map((item) => JSON.stringify([item.turn_id || "", item.role || "", item.phase || "", String(item.message || "").replace(/\s+/g, " ")])),
-  );
+  const seen = new Set(transcript.map((item) => transcriptMessageKey(item)));
+  const appendedMessages = [];
   for (const message of messages) {
-    const key = JSON.stringify([message.turn_id || "", message.role || "", message.phase || "", String(message.message || "").replace(/\s+/g, " ")]);
+    const key = transcriptMessageKey(message);
     if (!seen.has(key)) {
       seen.add(key);
       transcript.push(message);
+      appendedMessages.push(message);
     }
   }
 
   if (!existingTranscript && transcript.length === 0) {
-    return { transcript: null, nextParserState, touched: false };
+    return {
+      transcript: null,
+      nextParserState,
+      touched: false,
+      created: false,
+      bundlePath: null,
+      bundleRelPath: null,
+      changedPaths: [],
+    };
+  }
+
+  if (appendedMessages.length === 0) {
+    return {
+      transcript,
+      nextParserState,
+      touched: false,
+      created: false,
+      bundlePath: resolveThreadBundlePath(memoryDir, thread.threadId),
+      bundleRelPath: resolveThreadBundleRelPath(memoryDir, thread.threadId),
+      changedPaths: [],
+    };
   }
 
   const sourceArchivePath = path.join(memoryDir, "threads", `${thread.threadId}.rollout.jsonl.gz`);
-  saveThreadTranscript(memoryDir, thread.threadId, transcript);
-  upsertThreadIndexEntry(memoryDir, {
+  const bundleResult = appendThreadTranscript(memoryDir, thread.threadId, appendedMessages, { existingTranscript: transcript.slice(0, transcript.length - appendedMessages.length) });
+  const changedPaths = [bundleResult.relPath, ...bundleResult.removedPaths];
+  const indexResult = upsertThreadIndexEntry(memoryDir, {
     thread_id: thread.threadId,
     title: thread.title,
     thread_name: thread.sessionIndexEntry?.thread_name || null,
     created_at: thread.createdAt,
     updated_at: thread.updatedAt,
     source_session_relpath: relativeSessionPath(thread.rolloutPath),
-    bundle_path: path.join("threads", `${thread.threadId}.json`),
+    bundle_path: bundleResult.relPath,
   });
-  if (includeRawThreads && fs.existsSync(thread.rolloutPath)) {
-    fs.writeFileSync(sourceArchivePath, zlib.gzipSync(fs.readFileSync(thread.rolloutPath)));
+  if (indexResult.changed) {
+    changedPaths.push("thread-index.json");
   }
-  return { transcript, nextParserState, touched: transcript.length > 0 };
+  if (includeRawThreads && fs.existsSync(thread.rolloutPath)) {
+    if (writeBufferIfChanged(sourceArchivePath, zlib.gzipSync(fs.readFileSync(thread.rolloutPath)))) {
+      changedPaths.push(path.posix.join("threads", `${thread.threadId}.rollout.jsonl.gz`));
+    }
+  } else if (fs.existsSync(sourceArchivePath)) {
+    fs.rmSync(sourceArchivePath, { force: true });
+    changedPaths.push(path.posix.join("threads", `${thread.threadId}.rollout.jsonl.gz`));
+  }
+  return {
+    transcript,
+    nextParserState,
+    touched: appendedMessages.length > 0,
+    created: !existingTranscript,
+    bundlePath: bundleResult.filePath,
+    bundleRelPath: bundleResult.relPath,
+    changedPaths,
+  };
 }
 
 function loadThreadIndex(memoryDir) {
@@ -174,8 +214,11 @@ function loadThreadIndex(memoryDir) {
 
 function saveThreadIndex(memoryDir, payload) {
   const next = [...payload].sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
-  fs.writeFileSync(threadIndexPath(memoryDir), JSON.stringify(next, null, 2) + "\n", "utf8");
-  return next;
+  const changed = writeJsonFileIfChanged(threadIndexPath(memoryDir), next);
+  return {
+    entries: next,
+    changed,
+  };
 }
 
 function upsertThreadIndexEntry(memoryDir, entry) {
@@ -205,12 +248,12 @@ function buildThreadManifest(repoPath, thread) {
 }
 
 function materializeRootFromThread(memoryDir, threadId) {
-  const bundlePath = path.join(memoryDir, "threads", `${threadId}.json`);
+  const bundlePath = resolveThreadBundlePath(memoryDir, threadId);
   if (!fs.existsSync(bundlePath)) {
     throw new Error(`Missing thread bundle: ${bundlePath}`);
   }
   cleanupRootHistoryArtifacts(memoryDir);
-  fs.writeFileSync(currentThreadPath(memoryDir), JSON.stringify({ thread_id: threadId }, null, 2) + "\n", "utf8");
+  writeCurrentThread(memoryDir, threadId);
 }
 
 function clearMaterializedRoot(memoryDir) {
@@ -219,25 +262,53 @@ function clearMaterializedRoot(memoryDir) {
   if (fs.existsSync(currentPath)) fs.rmSync(currentPath, { force: true });
 }
 
-async function pushMemoryTree(profile, memoryDir, prefix) {
+function writeCurrentThread(memoryDir, threadId) {
+  return writeJsonFileIfChanged(currentThreadPath(memoryDir), { thread_id: threadId });
+}
+
+async function pushMemoryTree(profile, memoryDir, prefix, { relPaths = null, prune = true, sourceDir = memoryDir } = {}) {
   const uploaded = [];
   const desired = new Map();
-  for (const filePath of iterMemoryFiles(memoryDir)) {
-    const relPath = path.relative(memoryDir, filePath).split(path.sep).join("/");
-    const key = `${prefix.replace(/\/+$/, "")}/${relPath}`;
-    desired.set(key, fs.readFileSync(filePath));
+  const deleted = [];
+  const normalizedPrefix = prefix.replace(/\/+$/, "");
+  const sourceRoot = path.resolve(sourceDir || memoryDir);
+  const selectedRelPaths = relPaths
+    ? [...new Set(relPaths.map((item) => String(item).split(path.sep).join("/")))]
+    : iterMemoryFiles(sourceRoot).map((filePath) => path.relative(sourceRoot, filePath).split(path.sep).join("/"));
+
+  for (const relPath of selectedRelPaths) {
+    const key = `${normalizedPrefix}/${relPath}`;
+    const localPath = path.join(sourceRoot, relPath.split("/").join(path.sep));
+    if (fs.existsSync(localPath)) {
+      desired.set(key, fs.readFileSync(localPath));
+    } else if (relPaths) {
+      deleted.push(key);
+    }
   }
   for (const [key, payload] of desired.entries()) {
     await putR2Object(profile, key, payload);
     uploaded.push(key);
   }
-  const remoteKeys = new Set((await listR2Objects(profile, prefix.replace(/\/+$/, "") + "/")).map((item) => item.key));
-  for (const key of remoteKeys) {
-    if (!desired.has(key)) {
-      await deleteR2Object(profile, key);
+  for (const key of deleted) {
+    await deleteRemoteKeyIfPresent(profile, key);
+  }
+  if (prune) {
+    const remoteKeys = new Set((await listR2Objects(profile, normalizedPrefix + "/")).map((item) => item.key));
+    for (const key of remoteKeys) {
+      if (!desired.has(key)) {
+        await deleteR2Object(profile, key);
+      }
     }
   }
   return uploaded;
+}
+
+async function deleteRemoteKeyIfPresent(profile, key) {
+  try {
+    await deleteR2Object(profile, key);
+  } catch {
+    // Ignore missing-key style failures during targeted cleanup.
+  }
 }
 
 async function pullMemoryTree(profile, memoryDir, prefix) {
@@ -248,14 +319,62 @@ async function pullMemoryTree(profile, memoryDir, prefix) {
     const key = item.key;
     const relPath = key.slice(normalizedPrefix.length);
     const localPath = path.join(memoryDir, relPath);
-    fs.mkdirSync(path.dirname(localPath), { recursive: true });
-    fs.writeFileSync(localPath, await getR2Object(profile, key));
-    downloaded.push(localPath);
+    const payload = await getR2Object(profile, key);
+    if (writeBufferIfChanged(localPath, payload)) {
+      downloaded.push(localPath);
+    }
     remotePaths.add(path.resolve(localPath));
   }
   pruneRemovedLocalFiles(memoryDir, remotePaths);
   cleanupLegacyThreadArtifacts(memoryDir);
   return downloaded;
+}
+
+function reconcileRepoThreads(repoPath, memoryDir, { codexHome, includeRawThreads = false, discoverThreads = discoverThreadsForRepo } = {}) {
+  ensureMemoryLayout(memoryDir);
+  cleanupLegacyThreadArtifacts(memoryDir);
+  cleanupRootHistoryArtifacts(memoryDir);
+  const repoState = loadRepoState(memoryDir);
+  const threads = discoverThreads(repoPath, codexHome, repoState);
+  const existingIndex = new Map(loadThreadIndex(memoryDir).map((entry) => [entry.thread_id, entry]));
+  const reconciledThreads = [];
+  const changedPaths = new Set();
+
+  for (const thread of threads) {
+    const previousEntry = existingIndex.get(thread.threadId) || null;
+    const bundlePath = resolveThreadBundlePath(memoryDir, thread.threadId, previousEntry?.bundle_path || null);
+    const bundleExists = fs.existsSync(bundlePath);
+    const previousUpdatedAt = Number(previousEntry?.updated_at || 0);
+    const threadUpdatedAt = Number(thread.updatedAt || 0);
+    const needsRefresh = Boolean(thread.rolloutPath && fs.existsSync(thread.rolloutPath) && (!bundleExists || threadUpdatedAt > previousUpdatedAt));
+    if (!needsRefresh) {
+      continue;
+    }
+    const exportResult = exportThreadBundle(repoPath, memoryDir, thread, { includeRawThreads });
+    const indexResult = upsertThreadIndexEntry(memoryDir, buildThreadIndexEntry(thread, previousEntry, {
+      bundleRelPath: exportResult.bundleRelPath,
+    }));
+    changedPaths.add(exportResult.bundleRelPath);
+    for (const relPath of exportResult.changedPaths || []) {
+      changedPaths.add(relPath);
+    }
+    if (indexResult.changed) {
+      changedPaths.add("thread-index.json");
+    }
+    reconciledThreads.push(thread);
+  }
+
+  const currentThread = threads[0]?.threadId || currentThreadId(memoryDir) || null;
+  if (currentThread && writeCurrentThread(memoryDir, currentThread)) {
+    changedPaths.add("current-thread.json");
+  }
+
+  return {
+    reconciled_threads: reconciledThreads.map((thread) => thread.threadId),
+    reconciled_thread_count: reconciledThreads.length,
+    current_thread: currentThread,
+    changed_paths: [...changedPaths],
+  };
 }
 
 async function pullRepoMemorySnapshot(repoPath, memoryDir, profile, repoState, { codexHome, thread = null } = {}) {
@@ -268,7 +387,7 @@ async function pullRepoMemorySnapshot(repoPath, memoryDir, profile, repoState, {
     threadId = JSON.parse(fs.readFileSync(currentThreadPath(memoryDir), "utf8")).thread_id || null;
   }
   let imported = null;
-  const bundlePath = threadId ? path.join(memoryDir, "threads", `${threadId}.json`) : null;
+  const bundlePath = threadId ? resolveThreadBundlePath(memoryDir, threadId) : null;
   if (threadId && bundlePath && fs.existsSync(bundlePath)) {
     imported = importThreadBundleToCodex(repoPath, memoryDir, threadId, { codexHome });
   }
@@ -338,9 +457,9 @@ function walkDirs(dirPath, dirs) {
 }
 
 function importThreadBundleToCodex(repoPath, memoryDir, threadId, { codexHome } = {}) {
-  const bundlePath = path.join(memoryDir, "threads", `${threadId}.json`);
-  const transcript = JSON.parse(fs.readFileSync(bundlePath, "utf8"));
-  const indexEntry = loadThreadIndex(memoryDir).find((item) => item.thread_id === threadId);
+  const indexEntry = loadThreadIndex(memoryDir).find((item) => item.thread_id === threadId) || null;
+  const bundlePath = resolveThreadBundlePath(memoryDir, threadId, indexEntry?.bundle_path || null);
+  const transcript = readTranscriptFile(bundlePath);
   const paths = codexPaths(codexHome);
 
   let rolloutPath = path.join(paths.sessionsRoot, "missing-rollout.jsonl");
@@ -404,14 +523,17 @@ function importThreadBundleToCodex(repoPath, memoryDir, threadId, { codexHome } 
   };
 }
 
-async function syncNow(repoPath, memoryDir, profile, { codexHome, includeRawThreads = false, prefix }) {
+async function syncNow(repoPath, memoryDir, profile, { codexHome, includeRawThreads = false, prefix, relPaths = null } = {}) {
   ensureMemoryLayout(memoryDir);
   cleanupLegacyThreadArtifacts(memoryDir);
   cleanupRootHistoryArtifacts(memoryDir);
   const indexPayload = loadThreadIndex(memoryDir);
   const currentThread = currentThreadId(memoryDir) || null;
-  const uploaded = await pushMemoryTree(profile, memoryDir, prefix);
   const threadIds = indexPayload.map((item) => item.thread_id).filter(Boolean);
+  const uploaded = await pushMemoryTree(profile, memoryDir, prefix, {
+    relPaths,
+    prune: !Array.isArray(relPaths),
+  });
   const syncState = recordSyncEvent(memoryDir, {
     repoPath,
     prefix,
@@ -421,6 +543,10 @@ async function syncNow(repoPath, memoryDir, profile, { codexHome, includeRawThre
     currentThread,
     threadsExported: 0,
     objectsUploaded: uploaded.length,
+  });
+  await pushMemoryTree(profile, memoryDir, prefix, {
+    relPaths: ["sync-state.json"],
+    prune: false,
   });
   const repoState = loadRepoState(memoryDir);
   return {
@@ -442,13 +568,29 @@ async function syncNow(repoPath, memoryDir, profile, { codexHome, includeRawThre
 }
 
 async function syncChangedThreads(repoPath, memoryDir, profile, { codexHome, includeRawThreads = false, prefix, changes = [], discoverThreads = discoverThreadsForRepo } = {}) {
-  const repoState = loadRepoState(memoryDir);
   const threadUpdate = applyChangedThreadsLocally(repoPath, memoryDir, {
     codexHome,
     includeRawThreads,
     changes,
     discoverThreads,
   });
+  return pushChangedThreads(repoPath, memoryDir, profile, {
+    prefix,
+    localResult: threadUpdate,
+  });
+}
+
+async function pushChangedThreads(repoPath, memoryDir, profile, { prefix, localResult, sourceDir = memoryDir, mirrorOnSuccess = false, command = "watch" } = {}) {
+  const repoState = loadRepoState(memoryDir);
+  const threadUpdate = normalizeLocalThreadUpdate(localResult);
+  if (threadUpdate.changed_paths.length === 0) {
+    return buildChangedThreadSyncResult(repoPath, memoryDir, repoState, prefix, threadUpdate, {
+      objectsUploaded: 0,
+      remotePushAttempted: false,
+      remotePushSucceeded: false,
+      remoteError: null,
+    });
+  }
   if (!profile) {
     return buildChangedThreadSyncResult(repoPath, memoryDir, repoState, prefix, threadUpdate, {
       objectsUploaded: 0,
@@ -459,16 +601,27 @@ async function syncChangedThreads(repoPath, memoryDir, profile, { codexHome, inc
   }
 
   try {
-    const uploaded = await pushMemoryTree(profile, memoryDir, prefix);
+    const uploaded = await pushMemoryTree(profile, memoryDir, prefix, {
+      relPaths: threadUpdate.changed_paths,
+      prune: false,
+      sourceDir,
+    });
+    if (mirrorOnSuccess && path.resolve(sourceDir) !== path.resolve(memoryDir)) {
+      mirrorChangedPaths(sourceDir, memoryDir, threadUpdate.changed_paths);
+    }
     const syncState = recordSyncEvent(memoryDir, {
       repoPath,
       prefix,
       direction: "push",
-      command: "watch",
+      command,
       threadIds: threadUpdate.thread_ids,
       currentThread: threadUpdate.current_thread,
-      threadsExported: threadUpdate.threads_exported,
+      threadsExported: threadUpdate.touched_thread_ids.length || threadUpdate.threads_exported,
       objectsUploaded: uploaded.length,
+    });
+    await pushMemoryTree(profile, memoryDir, prefix, {
+      relPaths: ["sync-state.json"],
+      prune: false,
     });
     return buildChangedThreadSyncResult(repoPath, memoryDir, loadRepoState(memoryDir), prefix, threadUpdate, {
       objectsUploaded: uploaded.length,
@@ -495,6 +648,8 @@ function applyChangedThreadsLocally(repoPath, memoryDir, { codexHome, includeRaw
   const paths = codexPaths(codexHome);
   const sessionIndexMap = readSessionIndexMap(paths.sessionIndexPath);
   const touchedThreadIds = [];
+  const newThreads = [];
+  const changedPaths = new Set();
   const threadMap = new Map(
     discoverThreads(repoPath, codexHome, repoState).map((thread) => [thread.threadId, thread]),
   );
@@ -516,21 +671,37 @@ function applyChangedThreadsLocally(repoPath, memoryDir, { codexHome, includeRaw
     });
     if (result.touched) {
       touchedThreadIds.push(thread.threadId);
+      for (const relPath of result.changedPaths || []) {
+        changedPaths.add(relPath);
+      }
+      if (result.created) {
+        newThreads.push({
+          thread_id: thread.threadId,
+          title: thread.title || thread.sessionIndexEntry?.thread_name || thread.threadId,
+          thread_name: thread.sessionIndexEntry?.thread_name || null,
+          bundle_path: result.bundleRelPath || canonicalThreadBundleRelPath(thread.threadId),
+          transcript_record_count: Array.isArray(result.transcript) ? result.transcript.length : 0,
+        });
+      }
     }
   }
 
   const indexPayload = loadThreadIndex(memoryDir);
   const currentThread = touchedThreadIds[touchedThreadIds.length - 1] || currentThreadId(memoryDir) || null;
-  if (currentThread) {
-    fs.writeFileSync(currentThreadPath(memoryDir), JSON.stringify({ thread_id: currentThread }, null, 2) + "\n", "utf8");
+  if (currentThread && writeCurrentThread(memoryDir, currentThread)) {
+    changedPaths.add("current-thread.json");
   }
 
   const threadIds = indexPayload.map((item) => item.thread_id).filter(Boolean);
   return {
     threads_exported: touchedThreadIds.length,
+    touched_thread_ids: [...new Set(touchedThreadIds)],
     thread_count: threadIds.length,
     thread_ids: threadIds,
     current_thread: currentThread,
+    new_threads: newThreads,
+    new_thread_count: newThreads.length,
+    changed_paths: [...changedPaths],
   };
 }
 
@@ -593,6 +764,9 @@ function buildChangedThreadSyncResult(repoPath, memoryDir, repoState, prefix, lo
     thread_count: localResult.thread_count,
     thread_ids: localResult.thread_ids,
     current_thread: localResult.current_thread,
+    new_threads: localResult.new_threads || [],
+    new_thread_count: localResult.new_thread_count || 0,
+    changed_paths: localResult.changed_paths || [],
     objects_uploaded: objectsUploaded,
     remote_push_attempted: remotePushAttempted,
     remote_push_succeeded: remotePushSucceeded,
@@ -727,16 +901,72 @@ function shouldSyncRelpath(relPath, threadIds, currentThreadIdValue) {
   if (relPath === "thread-index.json") return true;
   if (relPath === "memory.md") return true;
   if (relPath === "memory-state.json") return true;
+  if (relPath === "sync-state.json") return true;
   if (relPath === "current-thread.json") return currentThreadIdValue && threadIds.includes(currentThreadIdValue);
   const parts = relPath.split("/");
   if (parts.length === 2 && parts[0] === "threads") {
-    return threadIds.some((threadId) => parts[1] === `${threadId}.json` || parts[1] === `${threadId}.rollout.jsonl.gz`);
+    return threadIds.some((threadId) =>
+      parts[1] === `${threadId}.jsonl` ||
+      parts[1] === `${threadId}.json` ||
+      parts[1] === `${threadId}.rollout.jsonl.gz`);
   }
   return false;
 }
 
+function normalizeLocalThreadUpdate(localResult) {
+  const normalized = localResult || {};
+  const touchedThreadIds = Array.isArray(normalized.touched_thread_ids)
+    ? [...new Set(normalized.touched_thread_ids.filter(Boolean))]
+    : [];
+  const newThreads = Array.isArray(normalized.new_threads)
+    ? dedupeNewThreads(normalized.new_threads)
+    : [];
+  const changedPaths = Array.isArray(normalized.changed_paths)
+    ? [...new Set(normalized.changed_paths.filter(Boolean))]
+    : [];
+  const threadIds = Array.isArray(normalized.thread_ids)
+    ? [...new Set(normalized.thread_ids.filter(Boolean))]
+    : [];
+  return {
+    threads_exported: Number(normalized.threads_exported) || touchedThreadIds.length || 0,
+    touched_thread_ids: touchedThreadIds,
+    thread_count: Number(normalized.thread_count) || threadIds.length,
+    thread_ids: threadIds,
+    current_thread: normalized.current_thread || null,
+    new_threads: newThreads,
+    new_thread_count: Number(normalized.new_thread_count) || newThreads.length,
+    changed_paths: changedPaths,
+  };
+}
+
+function buildLocalResultFromMemoryDir(memoryDir) {
+  const threadIds = indexedThreadIds(memoryDir);
+  const currentThread = currentThreadId(memoryDir) || null;
+  return {
+    threads_exported: threadIds.length,
+    touched_thread_ids: [...threadIds],
+    thread_count: threadIds.length,
+    thread_ids: threadIds,
+    current_thread: currentThread,
+    new_threads: [],
+    new_thread_count: 0,
+    changed_paths: iterMemoryFiles(memoryDir).map((filePath) => path.relative(memoryDir, filePath).split(path.sep).join("/")),
+  };
+}
+
+function dedupeNewThreads(threads) {
+  const byId = new Map();
+  for (const thread of threads) {
+    if (!thread?.thread_id) {
+      continue;
+    }
+    byId.set(thread.thread_id, thread);
+  }
+  return [...byId.values()];
+}
+
 function shouldPreserveLocalRelpath(relPath) {
-  return relPath === "sync-state.json" || relPath.startsWith("conflicts/");
+  return relPath === "sync-state.json" || relPath.startsWith("conflicts/") || relPath.startsWith(".local-write/");
 }
 
 function relativeSessionPath(filePath) {
@@ -750,6 +980,11 @@ function cleanupLegacyThreadArtifacts(memoryDir) {
   if (!fs.existsSync(threadsDir)) {
     return;
   }
+  const canonicalThreadIds = new Set(
+    fs.readdirSync(threadsDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl") && !entry.name.endsWith(".rollout.jsonl.gz"))
+      .map((entry) => entry.name.slice(0, -".jsonl".length)),
+  );
   for (const entry of fs.readdirSync(threadsDir, { withFileTypes: true })) {
     const fullPath = path.join(threadsDir, entry.name);
     if (entry.isDirectory()) {
@@ -759,8 +994,14 @@ function cleanupLegacyThreadArtifacts(memoryDir) {
     if (!entry.isFile()) {
       continue;
     }
-    if (entry.name.endsWith(".json") || entry.name.endsWith(".rollout.jsonl.gz")) {
+    if (entry.name.endsWith(".jsonl") || entry.name.endsWith(".rollout.jsonl.gz")) {
       continue;
+    }
+    if (entry.name.endsWith(".json")) {
+      const threadId = entry.name.slice(0, -".json".length);
+      if (!canonicalThreadIds.has(threadId)) {
+        continue;
+      }
     }
     fs.rmSync(fullPath, { force: true });
   }
@@ -783,15 +1024,32 @@ function cleanupRootHistoryArtifacts(memoryDir) {
   }
 }
 
+function mirrorChangedPaths(sourceDir, targetDir, relPaths) {
+  for (const relPath of [...new Set((relPaths || []).filter(Boolean))]) {
+    const sourcePath = path.join(sourceDir, relPath.split("/").join(path.sep));
+    const targetPath = path.join(targetDir, relPath.split("/").join(path.sep));
+    if (fs.existsSync(sourcePath)) {
+      writeBufferIfChanged(targetPath, fs.readFileSync(sourcePath));
+      continue;
+    }
+    if (fs.existsSync(targetPath)) {
+      fs.rmSync(targetPath, { force: true });
+    }
+  }
+}
+
 module.exports = {
   applyChangedThreadsLocally,
+  buildLocalResultFromMemoryDir,
   cleanupThread,
   describeSyncState,
   exportRepoThreads,
   importThreadBundleToCodex,
   pullRepoMemorySnapshot,
   pullMemoryTree,
+  pushChangedThreads,
   pushMemoryTree,
+  reconcileRepoThreads,
   recordSyncEvent,
   updateThreadBundleFromRolloutChange,
   syncChangedThreads,

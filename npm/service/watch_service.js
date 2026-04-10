@@ -16,13 +16,16 @@ const {
 const { CursorStore } = require("./cursor_store");
 const { loadRepoR2Profile } = require("../lib/repo-auth");
 const { findManagedRepoForCwd, loadManagedRepos } = require("./repo_registry");
+const { resolveObservedThread } = require("./watch_context");
 const { isRolloutPath, readRolloutLastRecordSummary, readRolloutMeta } = require("./rollout_meta");
 const { readIncrementalJsonl } = require("./rollout_incremental");
 const { RepoSyncScheduler } = require("./scheduler");
+const { notify } = require("../lib/notify");
 const { extractCanonicalMessages } = require("../lib/summarize");
-const { syncChangedThreads } = require("../lib/sync");
+const { applyChangedThreadsLocally, pushChangedThreads } = require("../lib/sync");
 
 const DEFAULT_DEBOUNCE_MS = 1500;
+const DEFAULT_EVENT_BATCH_MS = 100;
 const PACKAGE_VERSION = packageVersionFromHere(__filename);
 
 function parseArgs(argv) {
@@ -98,6 +101,7 @@ function removeState(statePath) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
+  const eventBatchMs = Math.min(DEFAULT_EVENT_BATCH_MS, options.debounceMs);
   const sessionsRoot = path.join(options.codexHome, "sessions");
   const statePath = watchServiceStatePath(options.configDir);
   const serviceStartAt = new Date().toISOString();
@@ -116,6 +120,7 @@ async function main() {
     debounceMs: options.debounceMs,
     runSync: async (repo, payload) => {
       const memoryDir = path.join(repo.repoPath, ".codex-handoff");
+      const localWriteDir = path.join(memoryDir, ".local-write");
       let profile = null;
       let authError = null;
       try {
@@ -123,11 +128,11 @@ async function main() {
       } catch (error) {
         authError = error;
       }
-      const result = await syncChangedThreads(repo.repoPath, memoryDir, profile, {
-        codexHome: options.codexHome,
-        includeRawThreads: repo.includeRawThreads === true,
+      const result = await pushChangedThreads(repo.repoPath, memoryDir, profile, {
         prefix: repo.remotePrefix,
-        changes: payload?.changes || [],
+        localResult: payload?.localResult || null,
+        sourceDir: payload?.sourceDir || localWriteDir,
+        mirrorOnSuccess: true,
       });
       if (authError) {
         log(`remote push skipped ${repo.repoPath}: ${authError.message}`, serviceLogPath);
@@ -198,6 +203,7 @@ async function main() {
     service_log_path: serviceLogPath,
     watch_root: sessionsRoot,
     debounce_ms: options.debounceMs,
+    event_batch_ms: eventBatchMs,
     event_log_path: eventLogPath,
     raw_event_log_path: rawEventLogPath,
     changed_files_log_path: changedFilesLogPath,
@@ -218,8 +224,18 @@ async function main() {
     let meta = null;
     let changePayload = null;
     if ((normalizedType === "create" || normalizedType === "update") && isRolloutPath(resolvedPath)) {
-      meta = await readRolloutMeta(resolvedPath);
+      const rolloutMeta = await readRolloutMeta(resolvedPath);
       const previousCursor = cursorStore.get(resolvedPath) || null;
+      const observedBeforeParse = resolveObservedThread({
+        codexHome: options.codexHome,
+        rolloutPath: resolvedPath,
+        meta: rolloutMeta,
+        previousCursor,
+      });
+      const parserState = {
+        sessionId: previousCursor?.sessionId || rolloutMeta?.threadId || observedBeforeParse.threadId || null,
+        currentTurnId: previousCursor?.currentTurnId || null,
+      };
       const incremental = await readIncrementalJsonl(resolvedPath, previousCursor);
       const parser = extractCanonicalMessages(
         (incremental.newLines || []).map((line) => {
@@ -229,14 +245,23 @@ async function main() {
             return null;
           }
         }).filter(Boolean),
-        {
-          sessionId: previousCursor?.sessionId || meta?.threadId || null,
-          currentTurnId: previousCursor?.currentTurnId || null,
-        },
+        parserState,
       );
+      const observedThread = resolveObservedThread({
+        codexHome: options.codexHome,
+        rolloutPath: resolvedPath,
+        meta: rolloutMeta,
+        previousCursor,
+        parserState: parser.state,
+      });
+      meta = {
+        threadId: observedThread.threadId,
+        cwd: observedThread.cwd,
+        git: rolloutMeta?.git || null,
+      };
       const nextCursor = {
         ...incremental.nextState,
-        sessionId: parser.state.sessionId || meta?.threadId || null,
+        sessionId: parser.state.sessionId || observedThread.threadId || null,
         currentTurnId: parser.state.currentTurnId || null,
       };
       cursorStore.set(resolvedPath, nextCursor);
@@ -254,16 +279,16 @@ async function main() {
           ...lastRecord,
         });
       }
-      changePayload = {
-        rolloutPath: resolvedPath,
-        threadId: meta?.threadId || null,
-        cwd: meta?.cwd || null,
-        newLines: incremental.newLines || [],
-        parserState: {
-          sessionId: previousCursor?.sessionId || meta?.threadId || null,
-          currentTurnId: previousCursor?.currentTurnId || null,
-        },
-      };
+      if (parser.messages.length > 0 && observedThread.threadId) {
+        changePayload = {
+          rolloutPath: resolvedPath,
+          threadId: observedThread.threadId,
+          cwd: observedThread.cwd || null,
+          newLines: incremental.newLines || [],
+          parserState,
+          canonicalMessageCount: parser.messages.length,
+        };
+      }
       appendChangedFileLog(changedFilesLogPath, {
         eventType: normalizedType,
         filePath: resolvedPath,
@@ -282,7 +307,7 @@ async function main() {
       batch = [];
       flushTimer = null;
       void processEvents(events);
-    }, options.debounceMs);
+    }, eventBatchMs);
   }
 
   async function processEvents(events) {
@@ -295,7 +320,34 @@ async function main() {
         if (!isRolloutPath(event.path)) {
           continue;
         }
-        const meta = event.meta || await readRolloutMeta(event.path);
+        if (!event.changePayload) {
+          appendWatchEventLog(eventLogPath, {
+            eventType: event.type,
+            filePath: event.path,
+            action: "skip",
+            reason: "no_canonical_messages",
+          });
+          continue;
+        }
+        let meta = event.meta || await readRolloutMeta(event.path);
+        if (!meta?.cwd || !meta?.threadId) {
+          const observedThread = resolveObservedThread({
+            codexHome: options.codexHome,
+            rolloutPath: event.path,
+            meta,
+            parserState: {
+              sessionId: event.changePayload.threadId || null,
+              currentTurnId: event.changePayload.parserState?.currentTurnId || null,
+            },
+          });
+          meta = {
+            threadId: meta?.threadId || observedThread.threadId,
+            cwd: meta?.cwd || observedThread.cwd,
+            git: meta?.git || null,
+          };
+          event.changePayload.threadId = event.changePayload.threadId || observedThread.threadId || null;
+          event.changePayload.cwd = event.changePayload.cwd || observedThread.cwd || null;
+        }
         if (managedRepos.length === 0) {
           appendWatchEventLog(eventLogPath, {
             eventType: event.type,
@@ -361,7 +413,22 @@ async function main() {
           repoPath: repo.repoPath,
           action: "enqueue",
         });
-        scheduler.enqueue(repo, queued.get(key));
+      }
+
+      for (const payload of queued.values()) {
+        const memoryDir = path.join(payload.repo.repoPath, ".codex-handoff");
+        const localWriteDir = path.join(memoryDir, ".local-write");
+        const localResult = applyChangedThreadsLocally(payload.repo.repoPath, localWriteDir, {
+          codexHome: options.codexHome,
+          includeRawThreads: payload.repo.includeRawThreads === true,
+          changes: payload.changes || [],
+        });
+        if (localResult.new_threads?.length) {
+          notifyNewThreads(localResult.new_threads, serviceLogPath);
+        }
+        if (localResult.changed_paths.length > 0) {
+          scheduler.enqueue(payload.repo, { localResult, sourceDir: localWriteDir });
+        }
       }
 
       writeState(statePath, {
@@ -373,6 +440,7 @@ async function main() {
         codex_home: options.codexHome,
         watch_root: sessionsRoot,
         debounce_ms: options.debounceMs,
+        event_batch_ms: eventBatchMs,
         event_log_path: eventLogPath,
         raw_event_log_path: rawEventLogPath,
         changed_files_log_path: changedFilesLogPath,
@@ -474,6 +542,22 @@ function appendContentLog(logPath, details) {
     fields.push(`appended=${JSON.stringify(details.appendedJsonl)}`);
   }
   fs.appendFileSync(logPath, `${fields.join(" | ")}\n`, "utf8");
+}
+
+function notifyNewThreads(threads, logPath) {
+  for (const thread of threads) {
+    const title = "New Codex thread captured";
+    const displayName = String(thread.thread_name || thread.title || thread.thread_id || "Untitled thread").trim();
+    const bundlePath = String(thread.bundle_path || "").trim();
+    const count = Number(thread.transcript_record_count || 0);
+    const message = bundlePath
+      ? `${displayName} | ${bundlePath} | messages=${count}`
+      : `${displayName} | messages=${count}`;
+    const result = notify({ title, message });
+    if (!result.delivered && result.error) {
+      log(`notification failed ${thread.thread_id || ""}: ${result.error}`, logPath);
+    }
+  }
 }
 
 main().catch((error) => {

@@ -2,6 +2,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const { loadThreadTranscript, resolveThreadBundlePath, resolveThreadBundleRelPath } = require("./thread-bundles");
 
 const DEFAULT_MAX_THREAD_BYTES = 32768;
 const DEFAULT_MAX_DIGEST_THREADS = 100;
@@ -128,8 +129,8 @@ function prepareMemoryInputs(repoPath, memoryDir, inputDir, options) {
     for (const entry of [...threadIndex].sort(compareThreadIndex).slice(0, options.maxThreads)) {
       const threadId = entry?.thread_id;
       if (!threadId) continue;
-      const sourcePath = path.join(memoryDir, "threads", `${threadId}.json`);
-      const targetPath = path.join(threadsDir, `${threadId}.json`);
+      const sourcePath = resolveThreadBundlePath(memoryDir, threadId, entry?.bundle_path || null);
+      const targetPath = path.join(threadsDir, path.basename(sourcePath));
       const copiedThread = copyMemoryFile(memoryDir, path.relative(memoryDir, sourcePath), targetPath, copied, skipped, {
         inputDir,
         maxBytes: options.maxThreadBytes,
@@ -172,8 +173,8 @@ function buildThreadDigest(memoryDir, threadIndex, maxDigestThreads) {
 
 function summarizeThreadEntry(memoryDir, entry) {
   const threadId = entry?.thread_id || "";
-  const bundlePath = threadId ? path.join(memoryDir, "threads", `${threadId}.json`) : null;
-  const transcript = bundlePath ? readJson(bundlePath, null) : null;
+  const bundlePath = threadId ? resolveThreadBundlePath(memoryDir, threadId, entry?.bundle_path || null) : null;
+  const transcript = threadId ? loadThreadTranscript(memoryDir, threadId, entry?.bundle_path || null) : null;
   const rows = Array.isArray(transcript) ? transcript : [];
   const lastUser = [...rows].reverse().find((item) => item?.role === "user") || null;
   const lastAssistant = [...rows].reverse().find((item) => item?.role === "assistant") || null;
@@ -184,7 +185,7 @@ function summarizeThreadEntry(memoryDir, entry) {
     thread_name: entry?.thread_name || null,
     updated_at: entry?.updated_at || null,
     source_session_relpath: entry?.source_session_relpath || null,
-    bundle_path: entry?.bundle_path || (threadId ? `threads/${threadId}.json` : null),
+    bundle_path: entry?.bundle_path || (threadId ? resolveThreadBundleRelPath(memoryDir, threadId) : null),
     bundle_present: Boolean(transcript),
     message_count: rows.length,
     last_activity_at: lastRecord?.timestamp || entry?.updated_at || null,

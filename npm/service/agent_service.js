@@ -8,7 +8,7 @@ const { serviceState, clearServiceState } = require("../lib/agent-runtime");
 const { detectCodexProcesses, findScriptProcessPids } = require("../lib/process-utils");
 const { summarizeMemoryWithCodex } = require("../lib/memory");
 const { loadRepoR2Profile } = require("../lib/repo-auth");
-const { exportRepoThreads, pullRepoMemorySnapshot, syncNow } = require("../lib/sync");
+const { buildLocalResultFromMemoryDir, pullRepoMemorySnapshot, pushChangedThreads, syncNow } = require("../lib/sync");
 const { watchServiceState, isWatchServiceRunning, startWatchService, stopWatchService } = require("../lib/watch-runtime");
 const { loadRepoState } = require("../lib/workspace");
 const { AgentController } = require("./agent_controller");
@@ -321,10 +321,25 @@ async function runShutdownSync(configDir, codexHome, logger) {
       continue;
     }
     try {
-      const threads = await exportRepoThreads(repo.repoPath, memoryDir, {
-        codexHome,
-        includeRawThreads: repoState.include_raw_threads === true,
-      });
+      const profile = loadRepoR2Profile(memoryDir);
+      const localWriteDir = path.join(memoryDir, ".local-write");
+      let stagePushResult = {
+        thread_count: 0,
+        threads_exported: 0,
+        changed_paths: [],
+      };
+      if (fs.existsSync(localWriteDir)) {
+        const localWriteState = buildLocalResultFromMemoryDir(localWriteDir);
+        if (localWriteState.changed_paths.length > 0) {
+          stagePushResult = await pushChangedThreads(repo.repoPath, memoryDir, profile, {
+            prefix: repoState.remote_prefix,
+            localResult: localWriteState,
+            sourceDir: localWriteDir,
+            mirrorOnSuccess: true,
+            command: "shutdown-stage",
+          });
+        }
+      }
       const memoryResult = summarizeMemoryWithCodex(repo.repoPath, memoryDir, {
         goal: "Update compact repo-level memory after the Codex window closed.",
         maxThreads: 0,
@@ -332,19 +347,24 @@ async function runShutdownSync(configDir, codexHome, logger) {
         reasoningEffort: "low",
         timeoutMs: 180000,
       });
-      const profile = loadRepoR2Profile(memoryDir);
       const pushResult = await syncNow(repo.repoPath, memoryDir, profile, {
         codexHome,
         includeRawThreads: repoState.include_raw_threads === true,
         prefix: repoState.remote_prefix,
+        relPaths: [
+          "memory.md",
+          "memory-state.json",
+        ],
       });
       const entry = {
         repo: repo.repoPath,
         repo_slug: repo.repoSlug,
         status: "pushed",
-        thread_count: threads.length,
+        staged_thread_count: stagePushResult.thread_count || 0,
+        staged_threads_pushed: stagePushResult.threads_exported || 0,
+        thread_count: pushResult.thread_count || 0,
         memory_written: memoryResult.wrote_memory === true,
-        objects_uploaded: pushResult.objects_uploaded || 0,
+        objects_uploaded: (stagePushResult.objects_uploaded || 0) + (pushResult.objects_uploaded || 0),
         current_thread: pushResult.current_thread || null,
       };
       syncedRepos.push(entry);

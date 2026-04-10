@@ -4,8 +4,10 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
+const { dbCwd, dbRolloutPath, upsertThreadRow } = require("../lib/local-codex");
 const { normalizeComparablePath } = require("./common");
 const { findManagedRepoForCwd, loadManagedRepos } = require("./repo_registry");
+const { inferThreadIdFromRolloutPath, resolveObservedThread } = require("./watch_context");
 const { readIncrementalJsonl } = require("./rollout_incremental");
 const { readRolloutLastRecordSummary, readRolloutMeta } = require("./rollout_meta");
 const { RepoSyncScheduler } = require("./scheduler");
@@ -106,6 +108,34 @@ test("readRolloutMeta extracts session metadata from the first record", async ()
   });
 });
 
+test("readRolloutMeta skips malformed and non-meta lines until session metadata appears", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-rollout-late-meta-"));
+  const rolloutPath = path.join(tempDir, "rollout-2026-01-01-late-meta.jsonl");
+  fs.writeFileSync(
+    rolloutPath,
+    [
+      '{"type":"partial"',
+      JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-1" } }),
+      JSON.stringify({
+        type: "session_meta",
+        payload: {
+          id: "thread-late",
+          cwd: "/workspace/project",
+        },
+      }),
+      "",
+    ].join("\n"),
+    "utf8"
+  );
+
+  const meta = await readRolloutMeta(rolloutPath);
+  assert.deepEqual(meta, {
+    threadId: "thread-late",
+    cwd: "/workspace/project",
+    git: null,
+  });
+});
+
 test("readRolloutLastRecordSummary extracts the latest record JSON", async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-rollout-tail-"));
   const rolloutPath = path.join(tempDir, "rollout-2026-01-01-tail.jsonl");
@@ -148,12 +178,76 @@ test("readIncrementalJsonl returns appended lines after previous size", async ()
 
   const initial = await readIncrementalJsonl(rolloutPath, null);
   assert.equal(initial.mode, "bootstrap");
-  assert.deepEqual(initial.newLines, []);
+  assert.deepEqual(initial.newLines, ['{"a":1}']);
 
   fs.appendFileSync(rolloutPath, '{"b":2}\n{"c":3}\n', "utf8");
   const appended = await readIncrementalJsonl(rolloutPath, initial.nextState);
   assert.equal(appended.mode, "append");
   assert.deepEqual(appended.newLines, ['{"b":2}', '{"c":3}']);
+});
+
+test("readIncrementalJsonl preserves an unterminated trailing line until it is completed", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-incremental-fragment-"));
+  const rolloutPath = path.join(tempDir, "rollout-2026-01-01-fragment.jsonl");
+  fs.writeFileSync(rolloutPath, '{"a":1}\n{"b":2', "utf8");
+
+  const initial = await readIncrementalJsonl(rolloutPath, null);
+  assert.equal(initial.mode, "bootstrap");
+  assert.deepEqual(initial.newLines, ['{"a":1}']);
+  assert.equal(initial.nextState.remainder, '{"b":2');
+
+  fs.appendFileSync(rolloutPath, '}\n{"c":3}\n', "utf8");
+  const appended = await readIncrementalJsonl(rolloutPath, initial.nextState);
+  assert.equal(appended.mode, "append");
+  assert.deepEqual(appended.newLines, ['{"b":2}', '{"c":3}']);
+  assert.equal(appended.nextState.remainder, "");
+});
+
+test("resolveObservedThread falls back to SQLite metadata when rollout session_meta is unavailable", () => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-watch-home-"));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-watch-repo-"));
+  const rolloutDir = path.join(codexHome, "sessions", "2026", "04", "10");
+  const rolloutPath = path.join(rolloutDir, "rollout-2026-04-10T13-17-40-thread-new.jsonl");
+  fs.mkdirSync(rolloutDir, { recursive: true });
+  fs.writeFileSync(rolloutPath, '{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}\n', "utf8");
+
+  upsertThreadRow(path.join(codexHome, "state_5.sqlite"), {
+    id: "thread-new",
+    rollout_path: dbRolloutPath(rolloutPath),
+    created_at: 1,
+    updated_at: 2,
+    source: "vscode",
+    model_provider: "openai",
+    cwd: dbCwd(repoDir),
+    title: "Watched Thread",
+    sandbox_policy: JSON.stringify({ type: "danger-full-access" }),
+    approval_mode: "never",
+    tokens_used: 0,
+    has_user_event: 1,
+    archived: 0,
+    archived_at: null,
+    git_sha: null,
+    git_branch: "main",
+    git_origin_url: null,
+    cli_version: "",
+    first_user_message: "",
+    agent_nickname: null,
+    agent_role: null,
+    memory_mode: "enabled",
+    model: "gpt-5.4",
+    reasoning_effort: "medium",
+    agent_path: null,
+  });
+
+  const observed = resolveObservedThread({
+    codexHome,
+    rolloutPath,
+  });
+
+  assert.equal(inferThreadIdFromRolloutPath(rolloutPath), "thread-new");
+  assert.equal(observed.threadId, "thread-new");
+  assert.equal(observed.cwd, repoDir);
+  assert.equal(observed.source, "sqlite_rollout_path");
 });
 
 test("RepoSyncScheduler coalesces bursts and reruns once when dirtied during a run", async () => {

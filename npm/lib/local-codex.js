@@ -190,6 +190,39 @@ function threadRowExists(filePath, threadId) {
   }
 }
 
+function findThreadById(codexHome, threadId) {
+  const paths = codexPaths(codexHome);
+  if (!threadId || !fs.existsSync(paths.stateDbPath)) {
+    return null;
+  }
+  const db = new Database(paths.stateDbPath, { readonly: true, fileMustExist: true });
+  try {
+    const row = db.prepare("SELECT * FROM threads WHERE id = ? LIMIT 1").get(threadId);
+    return normalizeThreadLookupRow(row);
+  } finally {
+    db.close();
+  }
+}
+
+function findThreadByRolloutPath(codexHome, rolloutPath) {
+  const paths = codexPaths(codexHome);
+  if (!rolloutPath || !fs.existsSync(paths.stateDbPath)) {
+    return null;
+  }
+  const targetPath = normalizeCwd(rolloutPath);
+  if (!targetPath) {
+    return null;
+  }
+  const db = new Database(paths.stateDbPath, { readonly: true, fileMustExist: true });
+  try {
+    const rows = db.prepare("SELECT * FROM threads ORDER BY updated_at DESC").all();
+    const row = rows.find((candidate) => normalizeCwd(candidate.rollout_path) === targetPath) || null;
+    return normalizeThreadLookupRow(row);
+  } finally {
+    db.close();
+  }
+}
+
 function findRolloutPath(filePath, threadId) {
   if (!fs.existsSync(filePath)) {
     return null;
@@ -363,6 +396,21 @@ function isWindowsStylePath(value) {
   return /^[A-Za-z]:[\\/]/.test(value);
 }
 
+function normalizeThreadLookupRow(row) {
+  if (!row) {
+    return null;
+  }
+  return {
+    threadId: row.id,
+    title: row.title || row.id,
+    cwd: stripWindowsPrefix(String(row.cwd || "")) || null,
+    rolloutPath: stripWindowsPrefix(String(row.rollout_path || "")) || null,
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+    row,
+  };
+}
+
 module.exports = {
   cleanupThread,
   codexPaths,
@@ -370,6 +418,8 @@ module.exports = {
   dbRolloutPath,
   deleteThreadRow,
   discoverThreadsForRepo,
+  findThreadById,
+  findThreadByRolloutPath,
   findRolloutPath,
   gitOriginAliases,
   mergeGitOriginState,

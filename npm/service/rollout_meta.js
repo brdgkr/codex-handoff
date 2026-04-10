@@ -18,9 +18,14 @@ async function readRolloutMeta(filePath) {
       if (!line.trim()) {
         continue;
       }
-      const payload = JSON.parse(line);
+      let payload;
+      try {
+        payload = JSON.parse(line);
+      } catch {
+        continue;
+      }
       if (payload.type !== "session_meta" || !payload.payload) {
-        return null;
+        continue;
       }
       return {
         threadId: payload.payload.id || null,

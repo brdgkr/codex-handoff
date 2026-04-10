@@ -2,6 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const { canonicalizeRepoPath } = require("../service/common");
+const { writeJsonFileIfChanged } = require("./file-ops");
 const { gitOriginUrlFromRepo } = require("./git-config");
 const { mergeGitOriginState, normalizeCwd } = require("./local-codex");
 const { DEFAULT_REMOTE_AUTH_PATH, DEFAULT_REMOTE_AUTH_TYPE } = require("./repo-auth");
@@ -32,7 +33,7 @@ function loadRepoState(memoryDir) {
 function saveRepoState(memoryDir, payload) {
   ensureMemoryLayout(memoryDir);
   const filePath = repoStatePath(memoryDir);
-  fs.writeFileSync(filePath, JSON.stringify(normalizeRepoState(payload), null, 2) + "\n", "utf8");
+  writeJsonFileIfChanged(filePath, normalizeRepoState(payload));
   return filePath;
 }
 
@@ -43,7 +44,7 @@ function loadSyncState(memoryDir) {
 function saveSyncState(memoryDir, payload) {
   ensureMemoryLayout(memoryDir);
   const filePath = syncStatePath(memoryDir);
-  fs.writeFileSync(filePath, JSON.stringify(normalizeSyncState(payload), null, 2) + "\n", "utf8");
+  writeJsonFileIfChanged(filePath, normalizeSyncState(payload));
   return filePath;
 }
 

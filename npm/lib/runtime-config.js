@@ -48,6 +48,9 @@ function normalizeRepoMappings(reposPayload) {
     normalized[canonicalKey] = {
       ...existingState,
       repo_slug: existingState.repo_slug || nextState.repo_slug,
+      repo_slug_aliases: Array.isArray(existingState.repo_slug_aliases) && existingState.repo_slug_aliases.length
+        ? existingState.repo_slug_aliases
+        : nextState.repo_slug_aliases,
       remote_prefix: existingState.remote_prefix || nextState.remote_prefix,
       summary_mode: existingState.summary_mode || nextState.summary_mode,
       match_mode: existingState.match_mode || nextState.match_mode,
@@ -58,6 +61,10 @@ function normalizeRepoMappings(reposPayload) {
       project_name: existingState.project_name || nextState.project_name,
       workspace_root: existingState.workspace_root || nextState.workspace_root,
       machine_id: existingState.machine_id || nextState.machine_id,
+      git_origin_url: existingState.git_origin_url || nextState.git_origin_url || null,
+      git_origin_urls: Array.isArray(existingState.git_origin_urls) && existingState.git_origin_urls.length
+        ? existingState.git_origin_urls
+        : nextState.git_origin_urls,
       updated_at: existingState.updated_at || nextState.updated_at,
     };
   }
@@ -70,6 +77,9 @@ function normalizeRepoMappingState(repoState, canonicalRepoPath) {
   normalized.remote_auth_type = DEFAULT_REMOTE_AUTH_TYPE;
   normalized.remote_auth_path = DEFAULT_REMOTE_AUTH_PATH;
   normalized.workspace_root = canonicalRepoPath;
+  normalized.repo_slug_aliases = Array.isArray(normalized.repo_slug_aliases) ? normalized.repo_slug_aliases.filter(Boolean) : [];
+  normalized.git_origin_url = normalized.git_origin_url || null;
+  normalized.git_origin_urls = Array.isArray(normalized.git_origin_urls) ? normalized.git_origin_urls.filter(Boolean) : [];
   return normalized;
 }
 

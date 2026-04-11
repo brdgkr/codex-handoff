@@ -65,14 +65,14 @@ Before doing substantive work in this repository:
 
 This repository is attached to codex-handoff sync.
 - local project name: `codex-handoff`
-- local workspace root: `/Users/dukhyunlee/development/repos/ideook/codex-handoff`
+- local workspace root: `/Users/dukhyunlee/Documents/development/repos/ideook/codex-handoff`
 - remote auth: `global_dotenv`
 - remote auth file: `~/.codex-handoff/.env.local`
-- remote repo slug: `brdgkr-codex-handoff`
-- remote prefix: `repos/brdgkr-codex-handoff/`
+- remote repo slug: `ideook-codex-handoff`
+- remote prefix: `repos/ideook-codex-handoff/`
 - summary mode: `auto`
 - include raw threads: `false`
-- match status: `create_new`
+- match status: `existing_local`
 - installed skill path: `/Users/dukhyunlee/.codex/skills/codex-handoff`
 
 Before doing substantive work in this repository:

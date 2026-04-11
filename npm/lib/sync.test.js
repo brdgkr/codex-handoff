@@ -569,6 +569,7 @@ test("pushChangedThreads can upload from a local staging dir and mirror the remo
     assert.equal(fs.existsSync(path.join(memoryDir, "threads", "thread-stage.jsonl")), true);
     assert.equal(JSON.parse(fs.readFileSync(path.join(memoryDir, "current-thread.json"), "utf8")).thread_id, "thread-stage");
     assert.ok(uploaded.some((entry) => entry.key === "repos/project/machine-sources/machine-a/threads/thread-stage.jsonl"));
+    assert.ok(uploaded.some((entry) => entry.key === "repos/project/repo.json"));
   } finally {
     require.cache[r2Path].exports = originalR2;
     delete require.cache[syncPath];
@@ -629,6 +630,7 @@ test("syncNow only uploads thread payloads when sourceDir is local-threads", asy
     });
 
     assert.ok(uploaded.some((entry) => entry.key === "repos/project/machine-sources/machine-a/threads/thread-stage.jsonl"));
+    assert.ok(uploaded.some((entry) => entry.key === "repos/project/repo.json"));
     assert.equal(uploaded.some((entry) => entry.key === "repos/project/memory.md"), false);
     assert.equal(uploaded.some((entry) => entry.key === "repos/project/memory-state.json"), false);
   } finally {
@@ -724,6 +726,79 @@ test("pullRepoMemorySnapshot preserves local staging files while pruning the rem
     assert.equal(fs.existsSync(path.join(readDir, "repo.json")), false);
     assert.equal(fs.existsSync(path.join(readDir, "threads", "old-remote.jsonl")), false);
     assert.equal(fs.existsSync(path.join(stageDir, "threads", "local-stage.jsonl")), true);
+  } finally {
+    require.cache[r2Path].exports = originalR2;
+    delete require.cache[syncPath];
+  }
+});
+
+test("pullRepoMemorySnapshot applies remote repo metadata while reading thread payloads from the stable prefix", async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-pull-remote-repo-state-"));
+  const memoryDir = path.join(repoDir, ".codex-handoff");
+  const readDir = path.join(memoryDir, "synced-threads");
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-pull-remote-state-home-"));
+  fs.mkdirSync(readDir, { recursive: true });
+  fs.writeFileSync(path.join(memoryDir, "repo.json"), JSON.stringify({
+    repo_path: repoDir,
+    repo_slug: "ideook-codex-handoff",
+    machine_id: "machine-local",
+    remote_auth_type: "test",
+    remote_auth_path: "test",
+    remote_prefix: "repos/ideook-codex-handoff/",
+    git_origin_url: "https://github.com/ideook/codex-handoff.git",
+  }, null, 2) + "\n", "utf8");
+
+  const remoteObjects = new Map();
+  remoteObjects.set("repos/ideook-codex-handoff/repo.json", Buffer.from(JSON.stringify({
+    repo_slug: "ideook-codex-handoff",
+    remote_prefix: "repos/ideook-codex-handoff/",
+    git_origin_url: "https://github.com/brdgkr/codex-handoff.git",
+    git_origin_urls: ["https://github.com/ideook/codex-handoff.git"],
+    updated_at: "2026-04-11T10:00:00.000Z",
+  }, null, 2) + "\n"));
+  remoteObjects.set("repos/ideook-codex-handoff/machine-sources/machine-remote/threads/remote-new.jsonl", Buffer.from(`${JSON.stringify({
+    session_id: "remote-new",
+    turn_id: "turn-1",
+    timestamp: null,
+    role: "assistant",
+    phase: null,
+    message: "remote cached thread",
+  })}\n`));
+
+  const r2Path = require.resolve("./r2");
+  const originalR2 = require(r2Path);
+  require.cache[r2Path].exports = {
+    ...originalR2,
+    listR2Objects: async (_profile, prefix = "") => [...remoteObjects.keys()].filter((key) => key.startsWith(prefix)).map((key) => ({ key })),
+    getR2Object: async (_profile, key) => {
+      if (remoteObjects.has(key)) {
+        return remoteObjects.get(key);
+      }
+      throw new Error(`Missing key: ${key}`);
+    },
+    putR2Object: async () => ({ status: "200" }),
+    deleteR2Object: async () => ({ status: "204" }),
+  };
+  const syncPath = require.resolve("./sync");
+  delete require.cache[syncPath];
+  const freshSync = require("./sync");
+  const { loadRepoState: loadFreshRepoState } = require("./workspace");
+
+  try {
+    const result = await freshSync.pullRepoMemorySnapshot(
+      repoDir,
+      memoryDir,
+      { fake: true },
+      loadFreshRepoState(memoryDir),
+      { codexHome },
+    );
+
+    assert.equal(result.pulled_from_prefix, "repos/ideook-codex-handoff/");
+    assert.deepEqual(result.alias_remote_prefixes, []);
+    assert.equal(loadFreshRepoState(memoryDir).repo_slug, "ideook-codex-handoff");
+    assert.equal(loadFreshRepoState(memoryDir).git_origin_url, "https://github.com/brdgkr/codex-handoff.git");
+    assert.deepEqual(loadFreshRepoState(memoryDir).git_origin_urls, ["https://github.com/ideook/codex-handoff.git"]);
+    assert.equal(fs.existsSync(path.join(readDir, "threads", "remote-new.jsonl")), true);
   } finally {
     require.cache[r2Path].exports = originalR2;
     delete require.cache[syncPath];

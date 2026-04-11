@@ -39,6 +39,7 @@ const {
   loadSyncState,
   localThreadsDir,
   materializedRootPaths,
+  repoSyncPrefixes,
   saveRepoState,
   saveSyncState,
   syncedThreadsDir,
@@ -366,6 +367,117 @@ async function pullMemoryTree(profile, memoryDir, prefix) {
   return downloaded;
 }
 
+function syncTargetPrefixes(repoState, prefix, prefixes = []) {
+  return repoSyncPrefixes(repoState, [
+    ...(Array.isArray(prefixes) ? prefixes : []),
+    prefix,
+  ].filter(Boolean));
+}
+
+function parseRemotePrefixTimestamp(payload, keys = []) {
+  for (const key of keys) {
+    const value = payload?.[key];
+    const parsed = Date.parse(String(value || ""));
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+async function readRemotePrefixState(profile, prefix) {
+  const normalizedPrefix = String(prefix || "").trim().replace(/^\/+|\/+$/g, "");
+  if (!normalizedPrefix) {
+    return {
+      prefix: null,
+      exists: false,
+      sort_timestamp: null,
+      sync_state: null,
+      repo_state: null,
+      object_count: 0,
+    };
+  }
+  const prefixWithSlash = `${normalizedPrefix}/`;
+  const baseKey = normalizedPrefix;
+  let syncState = null;
+  let repoState = null;
+  try {
+    syncState = JSON.parse((await getR2Object(profile, `${baseKey}/sync-state.json`)).toString("utf8"));
+  } catch {
+    // Ignore missing sync-state metadata.
+  }
+  try {
+    repoState = JSON.parse((await getR2Object(profile, `${baseKey}/repo.json`)).toString("utf8"));
+  } catch {
+    try {
+      repoState = JSON.parse((await getR2Object(profile, `${baseKey}/manifest.json`)).toString("utf8"));
+    } catch {
+      // Ignore missing repo metadata.
+    }
+  }
+  let objectCount = 0;
+  if (!syncState && !repoState) {
+    objectCount = (await listR2Objects(profile, prefixWithSlash)).length;
+  }
+  return {
+    prefix: prefixWithSlash,
+    exists: Boolean(syncState || repoState || objectCount > 0),
+    sort_timestamp:
+      parseRemotePrefixTimestamp(syncState, ["last_sync_at"]) ||
+      parseRemotePrefixTimestamp(repoState, ["updated_at"]) ||
+      null,
+    sync_state: syncState,
+    repo_state: repoState,
+    object_count: objectCount,
+  };
+}
+
+async function selectPullPrefix(profile, prefixes) {
+  const candidates = [...new Set((prefixes || []).filter(Boolean))];
+  if (candidates.length === 0) {
+    return {
+      selected_candidate: null,
+      selected_prefix: null,
+      existing_prefixes: [],
+      inspected_prefixes: [],
+    };
+  }
+  const inspected = [];
+  for (let index = 0; index < candidates.length; index += 1) {
+    const state = await readRemotePrefixState(profile, candidates[index]);
+    inspected.push({ ...state, candidate_index: index });
+  }
+  const existing = inspected.filter((item) => item.exists);
+  existing.sort((a, b) => {
+    const left = a.sort_timestamp ?? Number.NEGATIVE_INFINITY;
+    const right = b.sort_timestamp ?? Number.NEGATIVE_INFINITY;
+    if (left !== right) {
+      return right - left;
+    }
+    return a.candidate_index - b.candidate_index;
+  });
+  return {
+    selected_candidate: existing[0] || null,
+    selected_prefix: existing[0]?.prefix || candidates[0],
+    existing_prefixes: existing.map((item) => item.prefix),
+    inspected_prefixes: inspected,
+  };
+}
+
+async function pushRepoControlFiles(profile, memoryDir, prefixes, relPaths = ["repo.json", "sync-state.json"]) {
+  const targetPrefixes = [...new Set((prefixes || []).filter(Boolean))];
+  let uploaded = [];
+  for (const targetPrefix of targetPrefixes) {
+    const result = await pushMemoryTree(profile, memoryDir, targetPrefix, {
+      relPaths,
+      prune: false,
+      sourceDir: memoryDir,
+    });
+    uploaded = uploaded.concat(result);
+  }
+  return uploaded;
+}
+
 function remoteKeyForRelPath(normalizedPrefix, relPath, machineId, { sourceIsPushSource = false } = {}) {
   const normalizedRelPath = String(relPath).split(path.sep).join("/");
   if (machineId && isThreadPayloadRelPath(normalizedRelPath)) {
@@ -468,8 +580,11 @@ function reconcileRepoThreads(repoPath, memoryDir, { codexHome, includeRawThread
 
 async function pullRepoMemorySnapshot(repoPath, memoryDir, profile, repoState, { codexHome, thread = null } = {}) {
   const targetDir = syncedThreadsDir(memoryDir);
-  const downloaded = await pullMemoryTree(profile, targetDir, repoState.remote_prefix);
-  const pulledRepoState = loadRepoState(targetDir);
+  const targetPrefixes = syncTargetPrefixes(repoState, repoState.remote_prefix);
+  const pullTarget = await selectPullPrefix(profile, targetPrefixes);
+  const selectedPrefix = pullTarget.selected_prefix || repoState.remote_prefix;
+  const downloaded = await pullMemoryTree(profile, targetDir, selectedPrefix);
+  const pulledRepoState = pullTarget.selected_candidate?.repo_state || loadRepoState(targetDir);
   const localizedRepoState = relocalizeRepoState(repoPath, pulledRepoState, repoState);
   saveRepoState(memoryDir, localizedRepoState);
   rebuildReadContextMetadata(targetDir);
@@ -497,6 +612,9 @@ async function pullRepoMemorySnapshot(repoPath, memoryDir, profile, repoState, {
     remote_auth_path: localizedRepoState.remote_auth_path || DEFAULT_REMOTE_AUTH_PATH,
     remote_prefix: localizedRepoState.remote_prefix,
     prefix: localizedRepoState.remote_prefix,
+    pulled_from_prefix: selectedPrefix,
+    alias_remote_prefixes: targetPrefixes.filter((prefix) => prefix !== localizedRepoState.remote_prefix),
+    source_remote_prefixes: pullTarget.existing_prefixes,
     downloaded_objects: downloaded.length,
     imported_thread: imported,
     sync_state_path: syncStatePath(memoryDir),
@@ -649,22 +767,31 @@ function importThreadBundleToCodex(repoPath, memoryDir, threadId, { codexHome } 
   };
 }
 
-async function syncNow(repoPath, memoryDir, profile, { codexHome, includeRawThreads = false, prefix, relPaths = null, sourceDir = memoryDir } = {}) {
+async function syncNow(repoPath, memoryDir, profile, { codexHome, includeRawThreads = false, prefix, prefixes = null, relPaths = null, sourceDir = memoryDir } = {}) {
   const sourceRoot = path.resolve(sourceDir || memoryDir);
   ensureMemoryLayout(sourceRoot);
   cleanupLegacyThreadArtifacts(sourceRoot);
   cleanupRootHistoryArtifacts(sourceRoot);
+  const repoState = loadRepoState(memoryDir);
+  const targetPrefixes = syncTargetPrefixes(repoState, prefix, prefixes);
+  const primaryPrefix = targetPrefixes[0] || prefix;
   const indexPayload = loadThreadIndex(sourceRoot);
   const currentThread = currentThreadId(sourceRoot) || null;
   const threadIds = indexPayload.map((item) => item.thread_id).filter(Boolean);
-  const uploaded = await pushMemoryTree(profile, memoryDir, prefix, {
-    relPaths,
-    prune: !Array.isArray(relPaths),
-    sourceDir: sourceRoot,
-  });
+  let uploaded = [];
+  for (const targetPrefix of targetPrefixes) {
+    const result = await pushMemoryTree(profile, memoryDir, targetPrefix, {
+      relPaths,
+      prune: !Array.isArray(relPaths),
+      sourceDir: sourceRoot,
+    });
+    if (targetPrefix === primaryPrefix) {
+      uploaded = result;
+    }
+  }
   const syncState = recordSyncEvent(memoryDir, {
     repoPath,
-    prefix,
+    prefix: primaryPrefix,
     direction: "push",
     command: "now",
     threadIds,
@@ -672,18 +799,15 @@ async function syncNow(repoPath, memoryDir, profile, { codexHome, includeRawThre
     threadsExported: 0,
     objectsUploaded: uploaded.length,
   });
-  await pushMemoryTree(profile, memoryDir, prefix, {
-    relPaths: ["sync-state.json"],
-    prune: false,
-  });
-  const repoState = loadRepoState(memoryDir);
+  await pushRepoControlFiles(profile, memoryDir, targetPrefixes);
   return {
     repo: repoPath,
     repo_slug: repoState.repo_slug,
     remote_auth_type: repoState.remote_auth_type || DEFAULT_REMOTE_AUTH_TYPE,
     remote_auth_path: repoState.remote_auth_path || DEFAULT_REMOTE_AUTH_PATH,
-    remote_prefix: prefix,
-    prefix,
+    remote_prefix: primaryPrefix,
+    prefix: primaryPrefix,
+    alias_remote_prefixes: targetPrefixes.filter((targetPrefix) => targetPrefix !== primaryPrefix),
     threads_exported: 0,
     thread_count: threadIds.length,
     thread_ids: threadIds,
@@ -695,7 +819,7 @@ async function syncNow(repoPath, memoryDir, profile, { codexHome, includeRawThre
   };
 }
 
-async function syncChangedThreads(repoPath, memoryDir, profile, { codexHome, includeRawThreads = false, prefix, changes = [], discoverThreads = discoverThreadsForRepo } = {}) {
+async function syncChangedThreads(repoPath, memoryDir, profile, { codexHome, includeRawThreads = false, prefix, prefixes = null, changes = [], discoverThreads = discoverThreadsForRepo } = {}) {
   const sourceDir = localThreadsDir(memoryDir);
   const threadUpdate = applyChangedThreadsLocally(repoPath, sourceDir, {
     codexHome,
@@ -705,43 +829,54 @@ async function syncChangedThreads(repoPath, memoryDir, profile, { codexHome, inc
   });
   return pushChangedThreads(repoPath, memoryDir, profile, {
     prefix,
+    prefixes,
     localResult: threadUpdate,
     sourceDir,
   });
 }
 
-async function pushChangedThreads(repoPath, memoryDir, profile, { prefix, localResult, sourceDir = memoryDir, mirrorOnSuccess = false, command = "watch" } = {}) {
+async function pushChangedThreads(repoPath, memoryDir, profile, { prefix, prefixes = null, localResult, sourceDir = memoryDir, mirrorOnSuccess = false, command = "watch" } = {}) {
   const repoState = loadRepoState(memoryDir);
+  const targetPrefixes = syncTargetPrefixes(repoState, prefix, prefixes);
+  const primaryPrefix = targetPrefixes[0] || prefix;
   const threadUpdate = normalizeLocalThreadUpdate(localResult);
   if (threadUpdate.changed_paths.length === 0) {
-    return buildChangedThreadSyncResult(repoPath, memoryDir, repoState, prefix, threadUpdate, {
+    return buildChangedThreadSyncResult(repoPath, memoryDir, repoState, primaryPrefix, threadUpdate, {
       objectsUploaded: 0,
       remotePushAttempted: false,
       remotePushSucceeded: false,
       remoteError: null,
+      aliasRemotePrefixes: targetPrefixes.filter((targetPrefix) => targetPrefix !== primaryPrefix),
     });
   }
   if (!profile) {
-    return buildChangedThreadSyncResult(repoPath, memoryDir, repoState, prefix, threadUpdate, {
+    return buildChangedThreadSyncResult(repoPath, memoryDir, repoState, primaryPrefix, threadUpdate, {
       objectsUploaded: 0,
       remotePushAttempted: false,
       remotePushSucceeded: false,
       remoteError: null,
+      aliasRemotePrefixes: targetPrefixes.filter((targetPrefix) => targetPrefix !== primaryPrefix),
     });
   }
 
   try {
-    const uploaded = await pushMemoryTree(profile, memoryDir, prefix, {
-      relPaths: threadUpdate.changed_paths,
-      prune: false,
-      sourceDir,
-    });
+    let uploaded = [];
+    for (const targetPrefix of targetPrefixes) {
+      const result = await pushMemoryTree(profile, memoryDir, targetPrefix, {
+        relPaths: threadUpdate.changed_paths,
+        prune: false,
+        sourceDir,
+      });
+      if (targetPrefix === primaryPrefix) {
+        uploaded = result;
+      }
+    }
     if (mirrorOnSuccess && path.resolve(sourceDir) !== path.resolve(memoryDir)) {
       mirrorChangedPaths(sourceDir, memoryDir, threadUpdate.changed_paths);
     }
     const syncState = recordSyncEvent(memoryDir, {
       repoPath,
-      prefix,
+      prefix: primaryPrefix,
       direction: "push",
       command,
       threadIds: threadUpdate.thread_ids,
@@ -749,23 +884,22 @@ async function pushChangedThreads(repoPath, memoryDir, profile, { prefix, localR
       threadsExported: threadUpdate.touched_thread_ids.length || threadUpdate.threads_exported,
       objectsUploaded: uploaded.length,
     });
-    await pushMemoryTree(profile, memoryDir, prefix, {
-      relPaths: ["sync-state.json"],
-      prune: false,
-    });
-    return buildChangedThreadSyncResult(repoPath, memoryDir, loadRepoState(memoryDir), prefix, threadUpdate, {
+    await pushRepoControlFiles(profile, memoryDir, targetPrefixes);
+    return buildChangedThreadSyncResult(repoPath, memoryDir, loadRepoState(memoryDir), primaryPrefix, threadUpdate, {
       objectsUploaded: uploaded.length,
       remotePushAttempted: true,
       remotePushSucceeded: true,
       remoteError: null,
+      aliasRemotePrefixes: targetPrefixes.filter((targetPrefix) => targetPrefix !== primaryPrefix),
       syncState,
     });
   } catch (error) {
-    return buildChangedThreadSyncResult(repoPath, memoryDir, loadRepoState(memoryDir), prefix, threadUpdate, {
+    return buildChangedThreadSyncResult(repoPath, memoryDir, loadRepoState(memoryDir), primaryPrefix, threadUpdate, {
       objectsUploaded: 0,
       remotePushAttempted: true,
       remotePushSucceeded: false,
       remoteError: error.message,
+      aliasRemotePrefixes: targetPrefixes.filter((targetPrefix) => targetPrefix !== primaryPrefix),
     });
   }
 }
@@ -880,6 +1014,7 @@ function buildChangedThreadSyncResult(repoPath, memoryDir, repoState, prefix, lo
   remotePushAttempted,
   remotePushSucceeded,
   remoteError,
+  aliasRemotePrefixes = [],
   syncState = null,
 }) {
   const state = syncState || loadSyncState(memoryDir);
@@ -890,6 +1025,7 @@ function buildChangedThreadSyncResult(repoPath, memoryDir, repoState, prefix, lo
     remote_auth_path: repoState.remote_auth_path || DEFAULT_REMOTE_AUTH_PATH,
     remote_prefix: prefix,
     prefix,
+    alias_remote_prefixes: aliasRemotePrefixes,
     threads_exported: localResult.threads_exported,
     thread_count: localResult.thread_count,
     thread_ids: localResult.thread_ids,
@@ -1164,6 +1300,7 @@ module.exports = {
   pullRepoMemorySnapshot,
   pullMemoryTree,
   pushChangedThreads,
+  pushRepoControlFiles,
   pushMemoryTree,
   reconcileRepoThreads,
   recordSyncEvent,

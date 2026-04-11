@@ -5,7 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 
-const { buildRepoState, ensureAgentsBlock, relocalizeRepoState, removeAgentsBlock, removeMemoryDirGitignoreEntry, unregisterRepoMapping } = require("./workspace");
+const { buildRepoState, ensureAgentsBlock, refreshRepoStateForCurrentRepo, relocalizeRepoState, removeAgentsBlock, removeMemoryDirGitignoreEntry, unregisterRepoMapping } = require("./workspace");
 
 function runGit(repoDir, ...args) {
   execFileSync("git", args, {
@@ -59,12 +59,18 @@ test("buildRepoState carries previous git origins forward when origin changes", 
 
   assert.equal(first.git_origin_url, "https://github.com/ideook/codex-handoff.git");
   assert.deepEqual(first.git_origin_urls, []);
+  assert.deepEqual(first.repo_slug_aliases, []);
   assert.equal(second.git_origin_url, "https://github.com/brdgkr/codex-handoff.git");
   assert.deepEqual(second.git_origin_urls, ["https://github.com/ideook/codex-handoff.git"]);
+  assert.deepEqual(second.repo_slug_aliases, ["ideook-codex-handoff"]);
   assert.equal(third.git_origin_url, "git@github.com:new-owner/codex-handoff.git");
   assert.deepEqual(third.git_origin_urls, [
     "https://github.com/brdgkr/codex-handoff.git",
     "https://github.com/ideook/codex-handoff.git",
+  ]);
+  assert.deepEqual(third.repo_slug_aliases, [
+    "ideook-codex-handoff",
+    "brdgkr-codex-handoff",
   ]);
 });
 
@@ -154,4 +160,22 @@ test("relocalizeRepoState rewrites foreign machine paths to the current local re
   assert.equal(repoState.remote_auth_type, "global_dotenv");
   assert.equal(repoState.remote_auth_path, "~/.codex-handoff/.env.local");
   assert.equal(repoState.repo_slug, "ideook-codex-handoff");
+});
+
+test("refreshRepoStateForCurrentRepo preserves the remote prefix while updating git origin metadata", () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-refresh-state-"));
+  runGit(repoDir, "init");
+  runGit(repoDir, "remote", "add", "origin", "https://github.com/ideook/codex-handoff.git");
+
+  const initial = buildRepoState(repoDir, {
+    machineId: "machine-1",
+  });
+
+  runGit(repoDir, "remote", "set-url", "origin", "https://github.com/brdgkr/codex-handoff.git");
+  const refreshed = refreshRepoStateForCurrentRepo(repoDir, initial);
+
+  assert.equal(refreshed.repo_slug, initial.repo_slug);
+  assert.equal(refreshed.remote_prefix, initial.remote_prefix);
+  assert.equal(refreshed.git_origin_url, "https://github.com/brdgkr/codex-handoff.git");
+  assert.deepEqual(refreshed.git_origin_urls, ["https://github.com/ideook/codex-handoff.git"]);
 });

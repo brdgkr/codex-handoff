@@ -155,7 +155,7 @@ test("new repo state defaults to raw thread archives disabled", () => {
   assert.equal(repoState.include_raw_threads, false);
 });
 
-test("resolveRepoSlug prefers the current origin-derived slug over stale local state", () => {
+test("resolveRepoSlug preserves an attached repo's existing remote slug after git origin changes", () => {
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-slug-refresh-"));
   const memoryDir = path.join(repoDir, ".codex-handoff");
   fs.mkdirSync(memoryDir, { recursive: true });
@@ -165,6 +165,7 @@ test("resolveRepoSlug prefers the current origin-derived slug over stale local s
     path.join(memoryDir, "repo.json"),
     JSON.stringify({
       repo_slug: "ideook-codex-handoff",
+      remote_prefix: "repos/ideook-codex-handoff/",
       match_status: "create_new",
       git_origin_url: "https://github.com/brdgkr/codex-handoff.git",
       git_origin_urls: ["https://github.com/ideook/codex-handoff.git"],
@@ -178,12 +179,32 @@ test("resolveRepoSlug prefers the current origin-derived slug over stale local s
   ], { project_name: "codex-handoff" });
 
   assert.deepEqual(result, {
-    repo_slug: "brdgkr-codex-handoff",
-    match_status: "matched_remote_inferred",
+    repo_slug: "ideook-codex-handoff",
+    match_status: "existing_local",
   });
 });
 
-test("resolveRepoSlug creates a new inferred slug when local state is stale and the new remote does not exist yet", () => {
+test("resolveRepoSlug matches an existing remote by git origin even when the prefix slug differs", () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-slug-alias-match-"));
+  const memoryDir = path.join(repoDir, ".codex-handoff");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  runGit(repoDir, "init");
+  runGit(repoDir, "remote", "add", "origin", "https://github.com/ideook/codex-handoff.git");
+
+  const result = resolveRepoSlug(repoDir, memoryDir, {}, [
+    {
+      repo_slug: "brdgkr-codex-handoff",
+      git_origin_url: "https://github.com/ideook/codex-handoff.git",
+    },
+  ], { project_name: "codex-handoff" });
+
+  assert.deepEqual(result, {
+    repo_slug: "brdgkr-codex-handoff",
+    match_status: "matched_remote_best_candidate",
+  });
+});
+
+test("resolveRepoSlug keeps the attached remote slug even if the inferred git-origin slug changes", () => {
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-slug-create-"));
   const memoryDir = path.join(repoDir, ".codex-handoff");
   fs.mkdirSync(memoryDir, { recursive: true });
@@ -203,8 +224,8 @@ test("resolveRepoSlug creates a new inferred slug when local state is stale and 
   ], { project_name: "codex-handoff" });
 
   assert.deepEqual(result, {
-    repo_slug: "brdgkr-codex-handoff",
-    match_status: "create_new",
+    repo_slug: "ideook-codex-handoff",
+    match_status: "existing_local",
   });
 });
 
@@ -231,6 +252,24 @@ test("resolveRepoSlug preserves an explicit local remote slug selection", () => 
   assert.deepEqual(result, {
     repo_slug: "ideook-codex-handoff",
     match_status: "existing_local",
+  });
+});
+
+test("resolveRepoSlug auto-selects the most recent remote when receive matching is otherwise ambiguous", () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-slug-auto-fallback-"));
+  const memoryDir = path.join(repoDir, ".codex-handoff");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  runGit(repoDir, "init");
+  runGit(repoDir, "remote", "add", "origin", "https://github.com/example/another-repo.git");
+
+  const result = resolveRepoSlug(repoDir, memoryDir, { matchMode: "existing" }, [
+    { repo_slug: "older-project", updated_at: "2026-04-10T00:00:00.000Z" },
+    { repo_slug: "newer-project", updated_at: "2026-04-11T00:00:00.000Z" },
+  ], { project_name: "codex-handoff" });
+
+  assert.deepEqual(result, {
+    repo_slug: "newer-project",
+    match_status: "matched_remote_auto_fallback",
   });
 });
 
@@ -457,4 +496,54 @@ test("CLI remote login stores credentials in global .codex-handoff/.env.local", 
   assert.equal(whoami.bucket, "bucket");
   assert.equal(whoami.auth_type, "global_dotenv");
   assert.equal(whoami.dotenv_path, path.join(configDir, ".env.local"));
+});
+
+test("CLI doctor refreshes config repo metadata when git origin changes", () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-doctor-refresh-config-"));
+  const memoryDir = path.join(repoDir, ".codex-handoff");
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-config-"));
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-home-"));
+  fs.mkdirSync(memoryDir, { recursive: true });
+  runGit(repoDir, "init");
+  runGit(repoDir, "remote", "add", "origin", "https://github.com/ideook/codex-handoff.git");
+  fs.writeFileSync(
+    path.join(memoryDir, "repo.json"),
+    JSON.stringify({
+      repo_slug: "ideook-codex-handoff",
+      remote_prefix: "repos/ideook-codex-handoff/",
+      git_origin_url: "https://github.com/ideook/codex-handoff.git",
+    }, null, 2) + "\n",
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(configDir, "config.json"),
+    JSON.stringify({
+      repos: {
+        [repoDir]: {
+          repo_slug: "ideook-codex-handoff",
+          remote_prefix: "repos/ideook-codex-handoff/",
+          git_origin_url: "https://github.com/ideook/codex-handoff.git",
+          git_origin_urls: [],
+        },
+      },
+    }, null, 2) + "\n",
+    "utf8",
+  );
+
+  runGit(repoDir, "remote", "set-url", "origin", "https://github.com/brdgkr/codex-handoff.git");
+
+  execFileSync(process.execPath, [cliPath, "--repo", repoDir, "doctor"], {
+    cwd: path.join(__dirname, ".."),
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOME: homeDir,
+      CODEX_HANDOFF_CONFIG_DIR: configDir,
+      NODE_NO_WARNINGS: "1",
+    },
+  });
+
+  const persisted = JSON.parse(fs.readFileSync(path.join(configDir, "config.json"), "utf8"));
+  assert.equal(persisted.repos[repoDir].git_origin_url, "https://github.com/brdgkr/codex-handoff.git");
+  assert.deepEqual(persisted.repos[repoDir].git_origin_urls, ["https://github.com/ideook/codex-handoff.git"]);
 });

@@ -161,11 +161,7 @@ npm run test:node
 - [Manual Index](docs/README.md)
 - [Command Reference](docs/command-reference.md)
 - [Operations Guide](docs/operations-guide.md)
-- [Agent Install UX](docs/agent-install-ux.md)
 - [Prompt Pack](docs/agent-install-prompts.md)
-- [npm Installer Spec](docs/npm-installer-spec.md)
-- [Global Watcher Architecture](docs/global-watcher-architecture.md)
-- [Thread Sync Design](docs/thread-sync-design.md)
 - [Handoff JSON Schema](schemas/handoff.schema.json)
 
 ## License

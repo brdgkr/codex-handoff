@@ -40,6 +40,7 @@ const {
   prepareLocalWriteSnapshot,
   pullRepoMemorySnapshot,
   pullMemoryTree,
+  pushRepoControlFiles,
   syncNow,
 } = require("./lib/sync");
 const {
@@ -51,9 +52,13 @@ const {
   localThreadsDir,
   loadRepoState,
   materializedRootPaths,
+  normalizeRepoSlugAliases,
   removeAgentsBlock,
   removeMemoryDirGitignoreEntry,
   registerRepoMapping,
+  repoPrefixForSlug,
+  repoSyncSlugs,
+  refreshRepoStateForCurrentRepo,
   saveRepoState,
   syncedThreadsDir,
   unregisterRepoMapping,
@@ -133,7 +138,7 @@ function main(argv = process.argv.slice(2)) {
   }
 
   if (args.command === "threads") {
-    return Promise.resolve(handleThreads(args, repoPath, memoryDir, codexHome));
+    return Promise.resolve(handleThreads(args, repoPath, memoryDir, configDir, codexHome));
   }
 
   if (args.command === "sync") {
@@ -229,24 +234,12 @@ function resolveIncludeRawThreads(args, fallback = false) {
 
 async function performEnable(repoPath, memoryDir, configDir, codexHome, args) {
   const config = loadConfig(configDir);
-  const existingRepoState = loadRepoState(memoryDir);
+  const existingRepoState = loadCurrentRepoState(repoPath, memoryDir, configDir);
   ensureRepoCredentialsForInstall(memoryDir, args, configDir);
   const profile = loadRepoR2Profile(memoryDir);
   const remoteDetails = await listRemoteRepoDetails(profile);
   const currentProject = describeCurrentProject(repoPath, codexHome);
   const matchResult = resolveRepoSlug(repoPath, memoryDir, args, remoteDetails, currentProject);
-  if (matchResult.selection_required) {
-    return {
-      repo: repoPath,
-      memory_dir: memoryDir,
-      machine_id: config.machine_id || null,
-      selection_required: true,
-      current_project: currentProject,
-      remote_candidates: matchResult.remote_candidates,
-      recommended_remote_project_id: matchResult.recommended_remote_project_id,
-      message: matchResult.message,
-    };
-  }
   const repoSlug = matchResult.repo_slug;
   if (!config.machine_id) {
     config.machine_id = cryptoRandomId();
@@ -291,39 +284,22 @@ async function performEnable(repoPath, memoryDir, configDir, codexHome, args) {
 
 async function handleEnable(repoPath, memoryDir, configDir, codexHome, args) {
   const result = await performEnable(repoPath, memoryDir, configDir, codexHome, args);
-  if (result.selection_required) {
-    printSelectionRequired(result);
-  } else {
-    printJson(result);
-  }
+  printJson(result);
   return 0;
 }
 
 async function handleSetup(repoPath, memoryDir, configDir, codexHome, args) {
   const enableResult = await performEnable(repoPath, memoryDir, configDir, codexHome, args);
-  if (enableResult.selection_required) {
-    printJson({
-      repo: repoPath,
-      setup: true,
-      selection_required: true,
-      enable_result: enableResult,
-      sync_action: null,
-      sync_result: null,
-      autostart_result: null,
-      autostart_error: null,
-      agent_result: null,
-    });
-    return 0;
-  }
-  const repoState = loadRepoState(memoryDir);
+  const repoState = loadCurrentRepoState(repoPath, memoryDir, configDir);
   const profile = loadRepoR2Profile(memoryDir);
-  const remoteSlugs = await listRemoteRepoSlugs(profile);
-  const remoteExists = remoteSlugs.includes(repoState.repo_slug);
+  const remoteDetails = enableResult.remote_candidate_details || await listRemoteRepoDetails(profile);
+  const remoteExists = remoteDetailsContainRepoState(repoState, remoteDetails);
   let syncResult = null;
   let syncAction = null;
   if (!args.skipSyncNow) {
     if (remoteExists) {
       syncResult = await performSyncPull(repoPath, memoryDir, profile, repoState, { codexHome, thread: args.thread || null, refreshMemory: true });
+      await pushRepoControlFiles(profile, memoryDir, [repoState.remote_prefix]);
       syncAction = "pull";
     } else {
       const stageSnapshot = prepareLocalWriteSnapshot(repoPath, memoryDir, {
@@ -367,7 +343,7 @@ async function handleSetup(repoPath, memoryDir, configDir, codexHome, args) {
 
 async function handleUninstall(repoPath, memoryDir, configDir, _codexHome, _args) {
   const config = loadConfig(configDir);
-  const repoState = loadRepoState(memoryDir);
+  const repoState = loadCurrentRepoState(repoPath, memoryDir, configDir);
   const unregistered = unregisterRepoMapping(config, repoPath);
   saveConfig(configDir, unregistered.config);
 
@@ -416,18 +392,10 @@ async function handleReceive(repoPath, memoryDir, configDir, codexHome, args) {
     matchMode: "existing",
     summaryMode: args.summaryMode || "auto",
   });
-  if (enableResult.selection_required) {
-    printSelectionRequired({
-      repo: repoPath,
-      receive: true,
-      selection_required: true,
-      enable_result: enableResult,
-    });
-    return 0;
-  }
-  const repoState = loadRepoState(memoryDir);
+  const repoState = loadCurrentRepoState(repoPath, memoryDir, configDir);
   const profile = loadRepoR2Profile(memoryDir);
   const syncResult = await performSyncPull(repoPath, memoryDir, profile, repoState, { codexHome, thread: args.thread || null, refreshMemory: true });
+  await pushRepoControlFiles(profile, memoryDir, [repoState.remote_prefix]);
   let autostartResult = null;
   let autostartError = null;
   if (!args.skipAutostart) {
@@ -454,9 +422,9 @@ async function handleReceive(repoPath, memoryDir, configDir, codexHome, args) {
   return 0;
 }
 
-async function handleThreads(args, repoPath, memoryDir, codexHome) {
+async function handleThreads(args, repoPath, memoryDir, configDir, codexHome) {
   if (args.subcommand === "scan") {
-    const threads = discoverThreadsForRepo(repoPath, codexHome, loadRepoState(memoryDir));
+    const threads = discoverThreadsForRepo(repoPath, codexHome, loadCurrentRepoState(repoPath, memoryDir, configDir));
     printJson({
       repo: repoPath,
       thread_count: threads.length,
@@ -499,7 +467,7 @@ async function handleThreads(args, repoPath, memoryDir, codexHome) {
 }
 
 async function handleSync(args, repoPath, memoryDir, configDir, codexHome) {
-  const repoState = requireRepoState(memoryDir);
+  const repoState = loadCurrentRepoState(repoPath, memoryDir, configDir, { required: true });
   if (args.subcommand === "status") {
     printJson(augmentSyncResult(memoryDir, repoState, {
       repo: repoPath,
@@ -528,6 +496,7 @@ async function handleSync(args, repoPath, memoryDir, configDir, codexHome) {
   }
   if (args.subcommand === "pull") {
     const result = await performSyncPull(repoPath, memoryDir, profile, repoState, { codexHome, thread: args.thread || null, refreshMemory: true });
+    await pushRepoControlFiles(profile, memoryDir, [repoState.remote_prefix]);
     printJson(result);
     return 0;
   }
@@ -618,7 +587,7 @@ function handleSkill(args, repoPath) {
 }
 
 async function handleAgent(args, repoPath, memoryDir, configDir, codexHome) {
-  const repoState = loadRepoState(memoryDir);
+  const repoState = loadCurrentRepoState(repoPath, memoryDir, configDir, { required: true });
   const state = liveServiceState(configDir);
   if (args.subcommand === "status") {
     return { ...statusPayload(repoPath, repoState, state, configDir), autostart: autostartStatus(repoState.repo_slug, configDir) };
@@ -700,7 +669,7 @@ async function handleAgent(args, repoPath, memoryDir, configDir, codexHome) {
 }
 
 async function handleSyncNow(repoPath, memoryDir, configDir, codexHome) {
-  const repoState = loadRepoState(memoryDir);
+  const repoState = loadCurrentRepoState(repoPath, memoryDir, configDir, { required: true });
   const profile = loadRepoR2Profile(memoryDir);
   const result = await syncNow(repoPath, memoryDir, profile, {
     codexHome,
@@ -712,7 +681,7 @@ async function handleSyncNow(repoPath, memoryDir, configDir, codexHome) {
 }
 
 function doctor(repoPath, memoryDir, configDir, codexHome) {
-  const repoState = loadRepoState(memoryDir);
+  const repoState = loadCurrentRepoState(repoPath, memoryDir, configDir);
   const authStatus = repoR2ProfileStatus(memoryDir);
   const syncReport = describeSyncState(memoryDir);
   const roots = materializedRootPaths(memoryDir);
@@ -862,6 +831,26 @@ function requireRepoState(memoryDir) {
   return repoState;
 }
 
+function persistRepoStateToConfig(configDir, repoPath, repoState) {
+  if (!configDir || !repoState?.repo_slug) {
+    return;
+  }
+  const config = loadConfig(configDir);
+  registerRepoMapping(config, repoPath, repoState);
+  saveConfig(configDir, config);
+}
+
+function loadCurrentRepoState(repoPath, memoryDir, configDir = null, { required = false } = {}) {
+  const repoState = required ? requireRepoState(memoryDir) : loadRepoState(memoryDir);
+  if (!Object.keys(repoState).length) {
+    return repoState;
+  }
+  const refreshed = refreshRepoStateForCurrentRepo(repoPath, repoState);
+  saveRepoState(memoryDir, refreshed);
+  persistRepoStateToConfig(configDir, repoPath, refreshed);
+  return refreshed;
+}
+
 function augmentSyncResult(memoryDir, repoState, payload) {
   const result = { ...payload };
   const syncReport = describeSyncState(memoryDir);
@@ -897,6 +886,19 @@ async function listRemoteRepoSlugs(profile) {
   return (await listRemoteRepoDetails(profile)).map((item) => item.repo_slug);
 }
 
+function remoteDetailSyncSlugs(detail) {
+  return [
+    detail.repo_slug,
+    ...(Array.isArray(detail.repo_slug_aliases) ? detail.repo_slug_aliases : []),
+    ...(Array.isArray(detail.prefix_repo_slugs) ? detail.prefix_repo_slugs : []),
+  ].filter(Boolean);
+}
+
+function remoteDetailsContainRepoState(repoState, remoteDetails) {
+  const localSlugs = new Set(repoSyncSlugs(repoState));
+  return remoteDetails.some((detail) => remoteDetailSyncSlugs(detail).some((slug) => localSlugs.has(slug)));
+}
+
 async function listRemoteRepoDetails(profile) {
   const keys = (await listR2Objects(profile, "repos/")).map((item) => item.key);
   const slugs = [...new Set(
@@ -905,21 +907,88 @@ async function listRemoteRepoDetails(profile) {
       .map((key) => key.split("/", 3)[1])
       .filter(Boolean),
   )].sort();
-  return Promise.all(slugs.map((slug) => fetchRemoteRepoDetail(profile, slug)));
+  const details = await Promise.all(slugs.map((slug) => fetchRemoteRepoDetail(profile, slug)));
+  return mergeRemoteRepoDetails(details);
 }
 
 async function fetchRemoteRepoDetail(profile, slug) {
   for (const candidate of [`repos/${slug}/repo.json`, `repos/${slug}/manifest.json`]) {
     try {
       const payload = JSON.parse((await getR2Object(profile, candidate)).toString("utf8"));
-      payload.repo_slug = payload.repo_slug || slug;
-      payload.manifest_key = payload.manifest_key || candidate;
-      return payload;
+      return normalizeRemoteRepoDetail({
+        ...payload,
+        repo_slug: payload.repo_slug || slug,
+        manifest_key: payload.manifest_key || candidate,
+        prefix_repo_slug: slug,
+      });
     } catch {
       // Continue to the next manifest candidate.
     }
   }
-  return { repo_slug: slug };
+  return normalizeRemoteRepoDetail({ repo_slug: slug, prefix_repo_slug: slug });
+}
+
+function normalizeRemoteRepoDetail(payload) {
+  const canonicalSlug = String(payload.repo_slug || payload.prefix_repo_slug || "").trim();
+  return {
+    ...payload,
+    repo_slug: canonicalSlug,
+    repo_slug_aliases: normalizeRepoSlugAliases(canonicalSlug, [
+      ...(Array.isArray(payload.repo_slug_aliases) ? payload.repo_slug_aliases : []),
+      ...(Array.isArray(payload.prefix_repo_slugs) ? payload.prefix_repo_slugs : []),
+      payload.prefix_repo_slug,
+    ]),
+    prefix_repo_slug: payload.prefix_repo_slug || canonicalSlug,
+  };
+}
+
+function mergeRemoteRepoDetails(details) {
+  const merged = new Map();
+  for (const detail of details) {
+    const normalized = normalizeRemoteRepoDetail(detail);
+    const buildPrefixRepoSlugs = (canonicalSlug, aliases, firstPrefixSlug = canonicalSlug) => {
+      const ordered = [firstPrefixSlug, canonicalSlug, ...aliases].filter(Boolean);
+      return [...new Set(ordered)];
+    };
+    const buildRemotePrefixes = (canonicalSlug, aliases, firstPrefixSlug = canonicalSlug) => {
+      return buildPrefixRepoSlugs(canonicalSlug, aliases, firstPrefixSlug)
+        .map((slug) => repoPrefixForSlug(slug))
+        .filter(Boolean);
+    };
+    const existing = merged.get(normalized.repo_slug);
+    if (!existing) {
+      merged.set(normalized.repo_slug, {
+        ...normalized,
+        prefix_repo_slugs: buildPrefixRepoSlugs(
+          normalized.repo_slug,
+          normalizeRepoSlugAliases(normalized.repo_slug, normalized.repo_slug_aliases),
+          normalized.prefix_repo_slug,
+        ),
+        remote_prefixes: buildRemotePrefixes(
+          normalized.repo_slug,
+          normalizeRepoSlugAliases(normalized.repo_slug, normalized.repo_slug_aliases),
+          normalized.prefix_repo_slug,
+        ),
+      });
+      continue;
+    }
+    const mergedAliases = normalizeRepoSlugAliases(normalized.repo_slug, [
+      ...(Array.isArray(existing.repo_slug_aliases) ? existing.repo_slug_aliases : []),
+      ...(Array.isArray(normalized.repo_slug_aliases) ? normalized.repo_slug_aliases : []),
+      existing.prefix_repo_slug,
+      normalized.prefix_repo_slug,
+      ...(Array.isArray(existing.prefix_repo_slugs) ? existing.prefix_repo_slugs : []),
+      ...(Array.isArray(normalized.prefix_repo_slugs) ? normalized.prefix_repo_slugs : []),
+    ]);
+    merged.set(normalized.repo_slug, {
+      ...existing,
+      ...normalized,
+      repo_slug_aliases: mergedAliases,
+      prefix_repo_slugs: buildPrefixRepoSlugs(normalized.repo_slug, mergedAliases, existing.prefix_repo_slug || normalized.prefix_repo_slug),
+      remote_prefixes: buildRemotePrefixes(normalized.repo_slug, mergedAliases, existing.prefix_repo_slug || normalized.prefix_repo_slug),
+    });
+  }
+  return [...merged.values()].sort((a, b) => String(a.repo_slug).localeCompare(String(b.repo_slug)));
 }
 
 function resolveRepoSlug(repoPath, memoryDir, args, remoteDetails, currentProject) {
@@ -927,6 +996,9 @@ function resolveRepoSlug(repoPath, memoryDir, args, remoteDetails, currentProjec
     return { repo_slug: args.remoteSlug, match_status: "explicit" };
   }
   const existing = loadRepoState(memoryDir);
+  if (existing.repo_slug && existing.remote_prefix) {
+    return { repo_slug: String(existing.repo_slug), match_status: "existing_local" };
+  }
   const inferred = inferRepoSlug(repoPath);
   const remoteSlugs = remoteDetails.map((item) => item.repo_slug);
   const staleExistingSlug = isStaleExistingRepoSlug(repoPath, existing, inferred);
@@ -986,21 +1058,21 @@ function resolveExistingRemoteMatch(repoPath, inferredSlug, remoteDetails, curre
     return { repo_slug: best.repo_slug, match_status: "matched_remote_best_candidate" };
   }
   const ranked = rankRemoteCandidates(repoPath, inferredSlug, remoteDetails, currentProject);
-  return {
-    selection_required: true,
-    recommended_remote_project_id: ranked.length && ranked[0].score > 0 ? ranked[0].repo_slug : null,
-    remote_candidates: ranked,
-    message: remoteSelectionRequiredMessage(repoPath, inferredSlug, currentProject, remoteDetails),
-  };
+  if (ranked.length > 0) {
+    return { repo_slug: ranked[0].repo_slug, match_status: "matched_remote_auto_fallback" };
+  }
+  return { repo_slug: inferredSlug, match_status: "create_new" };
 }
 
 function bestRemoteCandidate(repoPath, inferredSlug, remoteDetails, currentProject, { strongOnly = false } = {}) {
   let ranked = rankRemoteCandidates(repoPath, inferredSlug, remoteDetails, currentProject);
   if (strongOnly) {
-    ranked = ranked.filter((item) => item.reasons.includes("slug") || item.reasons.includes("git_origin"));
+    ranked = ranked.filter((item) =>
+      item.reasons.includes("slug") ||
+      item.reasons.includes("alias_slug") ||
+      item.reasons.includes("git_origin"));
   }
   if (!ranked.length || ranked[0].score <= 0) return null;
-  if (ranked.length > 1 && ranked[0].score === ranked[1].score) return null;
   return ranked[0];
 }
 
@@ -1015,6 +1087,9 @@ function rankRemoteCandidates(repoPath, inferredSlug, remoteDetails, currentProj
       if (item.repo_slug === inferredSlug) {
         score += 100;
         reasons.push("slug");
+      } else if ((Array.isArray(item.repo_slug_aliases) ? item.repo_slug_aliases : []).includes(inferredSlug)) {
+        score += 90;
+        reasons.push("alias_slug");
       }
       const candidateOrigins = gitOriginAliases(
         item.git_origin_url || null,
@@ -1038,57 +1113,19 @@ function rankRemoteCandidates(repoPath, inferredSlug, remoteDetails, currentProj
         score += 5;
         reasons.push("slug_contains_repo_name");
       }
-      return { ...item, score, reasons };
+      const updatedAt = Date.parse(String(item.updated_at || item.last_sync_at || ""));
+      return {
+        ...item,
+        score,
+        reasons,
+        updated_at_ms: Number.isFinite(updatedAt) ? updatedAt : Number.NEGATIVE_INFINITY,
+      };
     })
-    .sort((a, b) => b.score - a.score);
-}
-
-function remoteSelectionRequiredMessage(repoPath, inferredSlug, currentProject, remoteDetails) {
-  const lines = [
-    "Multiple remote repos are available and codex-handoff could not safely choose one automatically.",
-    `- local repo path: ${repoPath}`,
-    `- current project name: ${currentProject.project_name || path.basename(repoPath)}`,
-    `- inferred slug: ${inferredSlug}`,
-    "- remote candidates:",
-  ];
-  for (const item of remoteDetails) {
-    lines.push(`  - ${item.repo_slug} (project_name=${item.project_name || ""}, git_origin_url=${item.git_origin_url || ""}, repo_path=${item.repo_path || ""})`);
-  }
-  lines.push("Re-run with `--remote-slug <repo-slug>` to choose one, or use `--match-mode new` to create a new remote repo.");
-  return lines.join("\n");
-}
-
-function printSelectionRequired(result) {
-  process.stdout.write(formatSelectionRequiredText(result));
-}
-
-function formatSelectionRequiredText(result) {
-  const enableResult = result.enable_result || result;
-  const currentProject = enableResult.current_project || {};
-  const candidates = enableResult.remote_candidates || [];
-  const recommended = enableResult.recommended_remote_project_id;
-  const lines = [
-    "Remote project selection is required.",
-    "",
-    `Current project: ${currentProject.project_name || ""}`,
-    `Workspace root: ${currentProject.workspace_root || result.repo || ""}`,
-    "",
-  ];
-  if (enableResult.message) {
-    lines.push(enableResult.message, "");
-  }
-  lines.push("Candidates:");
-  candidates.forEach((item, index) => {
-    const marker = recommended && item.repo_slug === recommended ? " (recommended)" : "";
-    let line = `${index + 1}. ${item.repo_slug}${marker}`;
-    if (item.project_name) line += ` | project_name=${item.project_name}`;
-    if (item.repo_path) line += ` | repo_path=${item.repo_path}`;
-    if (item.score !== undefined) line += ` | score=${item.score}`;
-    if (Array.isArray(item.reasons) && item.reasons.length) line += ` | reasons=${item.reasons.join(", ")}`;
-    lines.push(line);
-  });
-  lines.push("", "Choose one remote project id and re-run with:", "  codex-handoff receive --remote-slug <remote-project-id>");
-  return `${lines.join("\n").trim()}\n`;
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      if (b.updated_at_ms !== a.updated_at_ms) return b.updated_at_ms - a.updated_at_ms;
+      return String(a.repo_slug).localeCompare(String(b.repo_slug));
+    });
 }
 
 async function purgeRemotePrefix(profile, repoSlug, { apply = false } = {}) {

@@ -7,7 +7,7 @@ const process = require("node:process");
 const { serviceState, clearServiceState } = require("../lib/agent-runtime");
 const { detectCodexProcesses, findScriptProcessPids } = require("../lib/process-utils");
 const { loadRepoR2Profile } = require("../lib/repo-auth");
-const { buildLocalResultFromMemoryDir, pullRepoMemorySnapshot, pushChangedThreads } = require("../lib/sync");
+const { buildLocalResultFromMemoryDir, pullRepoMemorySnapshot, pushChangedThreads, pushRepoControlFiles } = require("../lib/sync");
 const { watchServiceState, isWatchServiceRunning, startWatchService, stopWatchService } = require("../lib/watch-runtime");
 const { loadRepoState, localThreadsDir } = require("../lib/workspace");
 const { AgentController } = require("./agent_controller");
@@ -239,7 +239,13 @@ async function runStartupSync(configDir, codexHome, logger) {
 
   for (const repo of managedRepos) {
     const memoryDir = path.join(repo.repoPath, ".codex-handoff");
-    const repoState = ensureManagedRepoState(memoryDir, repo);
+    const previousRepoState = loadRepoState(memoryDir);
+    const repoState = ensureManagedRepoState(memoryDir, repo, { configDir });
+    const repoStateChanged =
+      previousRepoState.git_origin_url !== repoState.git_origin_url ||
+      JSON.stringify(previousRepoState.git_origin_urls || []) !== JSON.stringify(repoState.git_origin_urls || []) ||
+      previousRepoState.repo_path !== repoState.repo_path ||
+      previousRepoState.workspace_root !== repoState.workspace_root;
     if (!repoState?.repo_slug || !repoState?.remote_prefix) {
       skippedRepoCount += 1;
       recordManagedRepoEvent(configDir, "startup_sync_repo", {
@@ -252,6 +258,9 @@ async function runStartupSync(configDir, codexHome, logger) {
     }
     try {
       const profile = loadRepoR2Profile(memoryDir);
+      if (repoStateChanged) {
+        await pushRepoControlFiles(profile, memoryDir, [repoState.remote_prefix], ["repo.json"]);
+      }
       const recoveryDir = localThreadsDir(memoryDir);
       const recoveryLocalResult = buildLocalResultFromMemoryDir(recoveryDir);
       let recoveryResult = null;

@@ -22,8 +22,8 @@ const { readIncrementalJsonl } = require("./rollout_incremental");
 const { RepoSyncScheduler } = require("./scheduler");
 const { notify } = require("../lib/notify");
 const { extractCanonicalMessages } = require("../lib/summarize");
-const { applyChangedThreadsLocally, pushChangedThreads } = require("../lib/sync");
-const { localThreadsDir } = require("../lib/workspace");
+const { applyChangedThreadsLocally, pushChangedThreads, pushRepoControlFiles } = require("../lib/sync");
+const { loadRepoState, localThreadsDir } = require("../lib/workspace");
 
 const DEFAULT_DEBOUNCE_MS = 1500;
 const DEFAULT_EVENT_BATCH_MS = 100;
@@ -121,7 +121,13 @@ async function main() {
     debounceMs: options.debounceMs,
     runSync: async (repo, payload) => {
       const memoryDir = path.join(repo.repoPath, ".codex-handoff");
-      ensureManagedRepoState(memoryDir, repo);
+      const previousRepoState = loadRepoState(memoryDir);
+      const repoState = ensureManagedRepoState(memoryDir, repo, { configDir: options.configDir });
+      const repoStateChanged =
+        previousRepoState.git_origin_url !== repoState.git_origin_url ||
+        JSON.stringify(previousRepoState.git_origin_urls || []) !== JSON.stringify(repoState.git_origin_urls || []) ||
+        previousRepoState.repo_path !== repoState.repo_path ||
+        previousRepoState.workspace_root !== repoState.workspace_root;
       const stageDir = localThreadsDir(memoryDir);
       let profile = null;
       let authError = null;
@@ -131,11 +137,14 @@ async function main() {
         authError = error;
       }
       const result = await pushChangedThreads(repo.repoPath, memoryDir, profile, {
-        prefix: repo.remotePrefix,
+        prefix: repoState.remote_prefix,
         localResult: payload?.localResult || null,
         sourceDir: payload?.sourceDir || stageDir,
         mirrorOnSuccess: false,
       });
+      if (!authError && profile && repoStateChanged) {
+        await pushRepoControlFiles(profile, memoryDir, [repoState.remote_prefix], ["repo.json"]);
+      }
       if (authError) {
         log(`remote push skipped ${repo.repoPath}: ${authError.message}`, serviceLogPath);
       } else if (result.remote_error) {
@@ -419,7 +428,7 @@ async function main() {
 
       for (const payload of queued.values()) {
         const memoryDir = path.join(payload.repo.repoPath, ".codex-handoff");
-        ensureManagedRepoState(memoryDir, payload.repo);
+          ensureManagedRepoState(memoryDir, payload.repo, { configDir: options.configDir });
         const stageDir = localThreadsDir(memoryDir);
         const localResult = applyChangedThreadsLocally(payload.repo.repoPath, stageDir, {
           codexHome: options.codexHome,

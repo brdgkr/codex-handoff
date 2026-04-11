@@ -84,6 +84,80 @@ function inferRepoSlug(repoPath) {
   return slugify(path.basename(repoPath));
 }
 
+function normalizeRepoSlugValue(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return null;
+  }
+  const normalized = raw
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^[-._]+|[-._]+$/g, "")
+    .toLowerCase();
+  return normalized || null;
+}
+
+function repoPrefixForSlug(slug) {
+  const normalizedSlug = normalizeRepoSlugValue(slug);
+  return normalizedSlug ? `repos/${normalizedSlug}/` : null;
+}
+
+function normalizeRepoSlugAliases(currentSlug, aliases = []) {
+  const normalizedCurrent = normalizeRepoSlugValue(currentSlug);
+  const normalizedAliases = [];
+  const seen = new Set();
+  for (const value of aliases || []) {
+    const normalized = normalizeRepoSlugValue(value);
+    if (!normalized || normalized === normalizedCurrent || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    normalizedAliases.push(normalized);
+  }
+  return normalizedAliases;
+}
+
+function repoSyncSlugs(repoState) {
+  const normalized = normalizeRepoState(repoState);
+  if (!normalized.repo_slug) {
+    return [];
+  }
+  return [
+    normalized.repo_slug,
+    ...normalizeRepoSlugAliases(normalized.repo_slug, normalized.repo_slug_aliases),
+  ];
+}
+
+function repoSyncPrefixes(repoState, extraPrefixes = []) {
+  const normalized = normalizeRepoState(repoState);
+  const prefixes = [];
+  const seen = new Set();
+  const append = (value) => {
+    let normalizedPrefix = String(value || "").trim();
+    if (!normalizedPrefix) {
+      return;
+    }
+    normalizedPrefix = normalizedPrefix.replace(/^\/+|\/+$/g, "");
+    normalizedPrefix = `${normalizedPrefix}/`;
+    if (seen.has(normalizedPrefix)) {
+      return;
+    }
+    seen.add(normalizedPrefix);
+    prefixes.push(normalizedPrefix);
+  };
+
+  if (normalized.remote_prefix) {
+    append(normalized.remote_prefix);
+  } else if (normalized.repo_slug) {
+    append(repoPrefixForSlug(normalized.repo_slug));
+  }
+
+  for (const value of extraPrefixes || []) {
+    append(value);
+  }
+
+  return prefixes;
+}
+
 function buildRepoState(repoPath, { profileName, machineId, remoteSlug = null, includeRawThreads = false, summaryMode = "auto", matchMode = "auto", matchStatus = "create_new", projectName = null, previousRepoState = null }) {
   const slug = remoteSlug || inferRepoSlug(repoPath);
   const previousOrigins = normalizeRepoState(previousRepoState);
@@ -92,6 +166,10 @@ function buildRepoState(repoPath, { profileName, machineId, remoteSlug = null, i
     previousOrigins.git_origin_url || null,
     previousOrigins.git_origin_urls || [],
   );
+  const repoSlugAliases = normalizeRepoSlugAliases(slug, [
+    ...(Array.isArray(previousOrigins.repo_slug_aliases) ? previousOrigins.repo_slug_aliases : []),
+    ...(remoteSlug ? [] : [previousOrigins.repo_slug]),
+  ]);
   return {
     schema_version: "1.0",
     machine_id: machineId,
@@ -107,9 +185,10 @@ function buildRepoState(repoPath, { profileName, machineId, remoteSlug = null, i
     },
     repo_path: normalizeCwd(repoPath),
     repo_slug: slug,
+    repo_slug_aliases: repoSlugAliases,
     remote_auth_type: DEFAULT_REMOTE_AUTH_TYPE,
     remote_auth_path: DEFAULT_REMOTE_AUTH_PATH,
-    remote_prefix: `repos/${slug}/`,
+    remote_prefix: repoPrefixForSlug(slug),
     include_raw_threads: includeRawThreads,
     summary_mode: summaryMode,
     match_mode: matchMode,
@@ -118,6 +197,36 @@ function buildRepoState(repoPath, { profileName, machineId, remoteSlug = null, i
     git_origin_urls: gitOrigins.git_origin_urls,
     updated_at: new Date().toISOString(),
   };
+}
+
+function refreshRepoStateForCurrentRepo(repoPath, repoState = {}) {
+  const existing = normalizeRepoState(repoState);
+  if (!existing.repo_slug) {
+    return existing;
+  }
+  const gitOrigins = mergeGitOriginState(
+    gitOriginUrl(repoPath),
+    existing.git_origin_url || null,
+    existing.git_origin_urls || [],
+  );
+  return normalizeRepoState({
+    ...existing,
+    project_name: existing.project_name || path.basename(repoPath),
+    workspace_root: repoPath,
+    codex_project: {
+      project_name: existing.project_name || path.basename(repoPath),
+      workspace_root: repoPath,
+      is_active: Boolean(existing.codex_project?.is_active),
+      is_saved: Boolean(existing.codex_project?.is_saved),
+      is_in_project_order: Boolean(existing.codex_project?.is_in_project_order),
+      is_in_sidebar_groups: Boolean(existing.codex_project?.is_in_sidebar_groups),
+    },
+    repo_path: normalizeCwd(repoPath),
+    remote_prefix: existing.remote_prefix || repoPrefixForSlug(existing.repo_slug),
+    git_origin_url: gitOrigins.git_origin_url,
+    git_origin_urls: gitOrigins.git_origin_urls,
+    updated_at: new Date().toISOString(),
+  });
 }
 
 function registerRepoMapping(configPayload, repoPath, repoState) {
@@ -133,6 +242,7 @@ function registerRepoMapping(configPayload, repoPath, repoState) {
     project_name: repoState.project_name || "",
     workspace_root: repoState.workspace_root || canonicalRepoPath,
     repo_slug: repoState.repo_slug,
+    repo_slug_aliases: normalizeRepoSlugAliases(repoState.repo_slug, repoState.repo_slug_aliases),
     remote_auth_type: repoState.remote_auth_type || DEFAULT_REMOTE_AUTH_TYPE,
     remote_auth_path: repoState.remote_auth_path || DEFAULT_REMOTE_AUTH_PATH,
     remote_prefix: repoState.remote_prefix,
@@ -140,6 +250,8 @@ function registerRepoMapping(configPayload, repoPath, repoState) {
     include_raw_threads: repoState.include_raw_threads,
     match_mode: repoState.match_mode,
     match_status: repoState.match_status,
+    git_origin_url: repoState.git_origin_url || null,
+    git_origin_urls: Array.isArray(repoState.git_origin_urls) ? repoState.git_origin_urls : [],
     updated_at: new Date().toISOString(),
   };
   return configPayload;
@@ -306,8 +418,16 @@ function normalizeRepoState(payload) {
   const normalized = { ...payload };
   delete normalized.remote_profile;
   if (normalized.repo_slug) {
+    normalized.repo_slug = normalizeRepoSlugValue(normalized.repo_slug);
+  }
+  normalized.repo_slug_aliases = normalizeRepoSlugAliases(
+    normalized.repo_slug,
+    Array.isArray(normalized.repo_slug_aliases) ? normalized.repo_slug_aliases : [],
+  );
+  if (normalized.repo_slug) {
     normalized.remote_auth_type = DEFAULT_REMOTE_AUTH_TYPE;
     normalized.remote_auth_path = DEFAULT_REMOTE_AUTH_PATH;
+    normalized.remote_prefix = repoPrefixForSlug(normalized.repo_slug);
   }
   const gitOrigins = mergeGitOriginState(
     normalized.git_origin_url || null,
@@ -338,16 +458,29 @@ function relocalizeRepoState(repoPath, repoState, fallbackState = {}) {
   if (!source.repo_slug && !fallback.repo_slug) {
     return normalizeRepoState(source);
   }
+  const preserveFallbackCanonical = Boolean(
+    source.repo_slug &&
+    fallback.repo_slug &&
+    source.repo_slug !== fallback.repo_slug &&
+    normalizeRepoSlugAliases(fallback.repo_slug, fallback.repo_slug_aliases).includes(source.repo_slug),
+  );
   const projectName = fallback.project_name || source.project_name || path.basename(repoPath);
   const localized = buildRepoState(repoPath, {
     machineId: fallback.machine_id || source.machine_id || null,
-    remoteSlug: source.repo_slug || fallback.repo_slug || null,
+    remoteSlug: preserveFallbackCanonical
+      ? fallback.repo_slug
+      : (source.repo_slug || fallback.repo_slug || null),
     includeRawThreads: source.include_raw_threads === true || fallback.include_raw_threads === true,
     summaryMode: source.summary_mode || fallback.summary_mode || "auto",
     matchMode: fallback.match_mode || source.match_mode || "auto",
     matchStatus: fallback.match_status || source.match_status || "existing_local",
     projectName,
     previousRepoState: {
+      repo_slug: preserveFallbackCanonical ? source.repo_slug : fallback.repo_slug,
+      repo_slug_aliases: [
+        ...(Array.isArray(source.repo_slug_aliases) ? source.repo_slug_aliases : []),
+        ...(Array.isArray(fallback.repo_slug_aliases) ? fallback.repo_slug_aliases : []),
+      ],
       git_origin_url: source.git_origin_url || fallback.git_origin_url || null,
       git_origin_urls: [
         ...(Array.isArray(source.git_origin_urls) ? source.git_origin_urls : []),
@@ -385,8 +518,13 @@ module.exports = {
   materializedRootPaths,
   removeAgentsBlock,
   removeMemoryDirGitignoreEntry,
+  repoPrefixForSlug,
+  refreshRepoStateForCurrentRepo,
+  repoSyncPrefixes,
+  repoSyncSlugs,
   registerRepoMapping,
   relocalizeRepoState,
+  normalizeRepoSlugAliases,
   unregisterRepoMapping,
   saveRepoState,
   repoStatePath,

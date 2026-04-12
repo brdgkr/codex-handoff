@@ -5,11 +5,12 @@ const path = require("node:path");
 const process = require("node:process");
 
 const { serviceState, clearServiceState } = require("../lib/agent-runtime");
+const { memoryNeedsRefresh, refreshLocalMemory } = require("../lib/memory");
 const { detectCodexProcesses, findScriptProcessPids } = require("../lib/process-utils");
 const { loadRepoR2Profile } = require("../lib/repo-auth");
 const { buildLocalResultFromMemoryDir, pullRepoMemorySnapshot, pushChangedThreads, pushRepoControlFiles } = require("../lib/sync");
 const { watchServiceState, isWatchServiceRunning, startWatchService, stopWatchService } = require("../lib/watch-runtime");
-const { loadRepoState, localThreadsDir } = require("../lib/workspace");
+const { loadRepoState, localThreadsDir, syncedThreadsDir } = require("../lib/workspace");
 const { AgentController } = require("./agent_controller");
 const { agentServiceStatePath, packageVersionFromHere, resolveCodexHome, resolveConfigDir, watchServiceStatePath } = require("./common");
 const { ensureManagedRepoState, loadManagedRepos } = require("./repo_registry");
@@ -193,6 +194,7 @@ async function main() {
       };
     },
     performStartupSync: async () => runStartupSync(options.configDir, options.codexHome, logger),
+    performActivationSync: async () => runStartupSync(options.configDir, options.codexHome, logger, { reason: "activation" }),
     performBackgroundRefresh: async () => runBackgroundRepoMetadataRefresh(options.configDir, logger),
     performShutdownSync: async () => runShutdownSync(options.configDir, options.codexHome, logger),
     writeState: async (payload) => {
@@ -246,18 +248,169 @@ async function main() {
   await new Promise(() => {});
 }
 
-async function runStartupSync(configDir, codexHome, logger) {
-  const managedRepos = loadManagedRepos(configDir).filter((repo) => fs.existsSync(repo.repoPath));
+function refreshRepoMemory(repoPath, memoryDir, logger) {
+  try {
+    const result = refreshLocalMemory(repoPath, memoryDir);
+    return {
+      status: result.skipped ? "skipped" : "refreshed",
+      refreshed: result.refreshed === true,
+      skipped: result.skipped === true,
+      reason: result.reason || null,
+      memory_path: result.memory_path || null,
+      input_memory_dir: result.input_memory_dir || null,
+    };
+  } catch (error) {
+    logger.write(`memory refresh error ${repoPath}: ${error.message}`);
+    return {
+      status: "error",
+      refreshed: false,
+      skipped: false,
+      reason: "error",
+      error: error.message,
+    };
+  }
+}
+
+function shouldRefreshRepoMemoryFromPull(pullResult) {
+  return Number(pullResult?.downloaded_objects || 0) > 0;
+}
+
+function shouldRefreshRepoMemoryForRepo(memoryDir, pullResult) {
+  if (shouldRefreshRepoMemoryFromPull(pullResult)) {
+    return true;
+  }
+  return memoryNeedsRefresh(memoryDir, syncedThreadsDir(memoryDir));
+}
+
+function summarizeMemoryCase(memoryRefresh) {
+  if (memoryRefresh?.error) {
+    return "memory_error";
+  }
+  if (memoryRefresh?.refreshed) {
+    return "memory_refreshed";
+  }
+  if (memoryRefresh?.reason === "no_synced_thread_change") {
+    return "memory_skipped_no_synced_thread_change";
+  }
+  if (memoryRefresh?.reason === "not_needed") {
+    return "memory_skipped_not_needed";
+  }
+  return "memory_skipped";
+}
+
+function summarizeThreadCase(result) {
+  if (result?.current_thread && result?.imported_thread?.thread_id) {
+    return "current_thread_imported";
+  }
+  if (result?.current_thread) {
+    return "current_thread_available";
+  }
+  return "no_current_thread";
+}
+
+function summarizeRepoSyncCase({ status, syncedThreadsChanged, memoryRefresh, recoveryResult, result }) {
+  if (status === "error") {
+    return "repo_sync_error";
+  }
+  if (status === "skipped") {
+    return "repo_skipped_missing_repo_state";
+  }
+  if (syncedThreadsChanged) {
+    if (memoryRefresh?.error) {
+      return "repo_changed_memory_error";
+    }
+    if (memoryRefresh?.refreshed) {
+      return "repo_changed_memory_refreshed";
+    }
+    return "repo_changed_memory_skipped";
+  }
+  if ((recoveryResult?.objects_uploaded || 0) > 0 && result?.current_thread) {
+    if (memoryRefresh?.refreshed) {
+      return "repo_unchanged_memory_refreshed_recovery_uploaded_current_thread";
+    }
+    return "repo_unchanged_recovery_uploaded_current_thread";
+  }
+  if ((recoveryResult?.objects_uploaded || 0) > 0) {
+    if (memoryRefresh?.refreshed) {
+      return "repo_unchanged_memory_refreshed_recovery_uploaded";
+    }
+    return "repo_unchanged_recovery_uploaded";
+  }
+  if (memoryRefresh?.refreshed) {
+    return "repo_unchanged_memory_refreshed";
+  }
+  return "repo_unchanged_no_synced_thread_change";
+}
+
+function summarizeCompletionCase({ changedRepoCount, unchangedRepoCount, skippedRepoCount, errorCount }) {
+  if (errorCount > 0 && changedRepoCount === 0 && unchangedRepoCount === 0 && skippedRepoCount === 0) {
+    return "errors_only";
+  }
+  if (errorCount > 0) {
+    return "completed_with_errors";
+  }
+  if (changedRepoCount > 0 && unchangedRepoCount === 0 && skippedRepoCount === 0) {
+    return "all_changed";
+  }
+  if (changedRepoCount === 0 && unchangedRepoCount > 0 && skippedRepoCount === 0) {
+    return "all_unchanged";
+  }
+  if (changedRepoCount === 0 && unchangedRepoCount === 0 && skippedRepoCount > 0) {
+    return "all_skipped";
+  }
+  if (changedRepoCount > 0 && unchangedRepoCount > 0 && skippedRepoCount === 0) {
+    return "mixed_changed_and_unchanged";
+  }
+  if (changedRepoCount > 0 && unchangedRepoCount === 0 && skippedRepoCount > 0) {
+    return "changed_with_skips";
+  }
+  if (changedRepoCount === 0 && unchangedRepoCount > 0 && skippedRepoCount > 0) {
+    return "unchanged_with_skips";
+  }
+  if (changedRepoCount > 0 && unchangedRepoCount > 0 && skippedRepoCount > 0) {
+    return "mixed_with_skips";
+  }
+  return "no_managed_repos";
+}
+
+function summarizeCompletionMemoryCase({ refreshedMemoryRepoCount, skippedMemoryRepoCount, errorCount }) {
+  if (errorCount > 0) {
+    return "memory_mixed_with_errors";
+  }
+  if (refreshedMemoryRepoCount > 0 && skippedMemoryRepoCount === 0) {
+    return "all_memory_refreshed";
+  }
+  if (refreshedMemoryRepoCount === 0 && skippedMemoryRepoCount > 0) {
+    return "all_memory_skipped";
+  }
+  if (refreshedMemoryRepoCount > 0 && skippedMemoryRepoCount > 0) {
+    return "mixed_memory_actions";
+  }
+  return "no_memory_actions";
+}
+
+async function runStartupSync(configDir, codexHome, logger, { reason = "startup", deps = {} } = {}) {
+  const loadManagedReposFn = deps.loadManagedRepos || loadManagedRepos;
+  const loadRepoStateFn = deps.loadRepoState || loadRepoState;
+  const ensureManagedRepoStateFn = deps.ensureManagedRepoState || ensureManagedRepoState;
+  const loadRepoR2ProfileFn = deps.loadRepoR2Profile || loadRepoR2Profile;
+  const pushRepoControlFilesFn = deps.pushRepoControlFiles || pushRepoControlFiles;
+  const buildLocalResultFromMemoryDirFn = deps.buildLocalResultFromMemoryDir || buildLocalResultFromMemoryDir;
+  const pushChangedThreadsFn = deps.pushChangedThreads || pushChangedThreads;
+  const pullRepoMemorySnapshotFn = deps.pullRepoMemorySnapshot || pullRepoMemorySnapshot;
+  const refreshRepoMemoryFn = deps.refreshRepoMemory || refreshRepoMemory;
+  const shouldRefreshRepoMemoryForRepoFn = deps.shouldRefreshRepoMemoryForRepo || shouldRefreshRepoMemoryForRepo;
+  const managedRepos = loadManagedReposFn(configDir).filter((repo) => fs.existsSync(repo.repoPath));
   const startedAt = new Date().toISOString();
-  logger.write(`startup sync invoked for codex_home=${codexHome}`);
-  recordManagedRepoEvent(configDir, "startup_sync_started", {
+  logger.write(`${reason} sync invoked for codex_home=${codexHome}`);
+  recordManagedRepoEvent(configDir, `${reason}_sync_started`, {
     started_at: startedAt,
     codex_home: codexHome,
     managed_repo_count: managedRepos.length,
   });
   if (managedRepos.length === 0) {
     const completedAt = new Date().toISOString();
-    recordManagedRepoEvent(configDir, "startup_sync_completed", {
+    recordManagedRepoEvent(configDir, `${reason}_sync_completed`, {
       completed_at: completedAt,
       managed_repo_count: 0,
     });
@@ -273,15 +426,19 @@ async function runStartupSync(configDir, codexHome, logger) {
   const syncedRepos = [];
   const errors = [];
   let skippedRepoCount = 0;
+  let changedRepoCount = 0;
+  let unchangedRepoCount = 0;
+  let refreshedMemoryRepoCount = 0;
+  let skippedMemoryRepoCount = 0;
 
   for (const repo of managedRepos) {
     const memoryDir = path.join(repo.repoPath, ".codex-handoff");
-    const previousRepoState = loadRepoState(memoryDir);
-    const repoState = ensureManagedRepoState(memoryDir, repo, { configDir });
+    const previousRepoState = loadRepoStateFn(memoryDir);
+    const repoState = ensureManagedRepoStateFn(memoryDir, repo, { configDir });
     const repoStateChanged = repoStateMetadataChanged(previousRepoState, repoState);
     if (!repoState?.repo_slug || !repoState?.remote_prefix) {
       skippedRepoCount += 1;
-      recordManagedRepoEvent(configDir, "startup_sync_repo", {
+      recordManagedRepoEvent(configDir, `${reason}_sync_repo`, {
         repo: repo.repoPath,
         repo_slug: repo.repoSlug,
         status: "skipped",
@@ -290,15 +447,15 @@ async function runStartupSync(configDir, codexHome, logger) {
       continue;
     }
     try {
-      const profile = loadRepoR2Profile(memoryDir);
+      const profile = loadRepoR2ProfileFn(memoryDir);
       if (repoStateChanged) {
-        await pushRepoControlFiles(profile, memoryDir, [repoState.remote_prefix], ["manifest.json"]);
+        await pushRepoControlFilesFn(profile, memoryDir, [repoState.remote_prefix], ["manifest.json"]);
       }
       const recoveryDir = localThreadsDir(memoryDir);
-      const recoveryLocalResult = buildLocalResultFromMemoryDir(recoveryDir);
+      const recoveryLocalResult = buildLocalResultFromMemoryDirFn(recoveryDir);
       let recoveryResult = null;
       if (recoveryLocalResult.changed_paths.length > 0) {
-        recoveryResult = await pushChangedThreads(repo.repoPath, memoryDir, profile, {
+        recoveryResult = await pushChangedThreadsFn(repo.repoPath, memoryDir, profile, {
           prefix: repoState.remote_prefix,
           localResult: recoveryLocalResult,
           sourceDir: recoveryDir,
@@ -306,20 +463,56 @@ async function runStartupSync(configDir, codexHome, logger) {
           command: "startup-recovery",
         });
       }
-      const result = await pullRepoMemorySnapshot(repo.repoPath, memoryDir, profile, repoState, { codexHome });
+      const result = await pullRepoMemorySnapshotFn(repo.repoPath, memoryDir, profile, repoState, { codexHome });
+      const syncedThreadsChanged = shouldRefreshRepoMemoryFromPull(result);
+      const shouldRefreshMemory = shouldRefreshRepoMemoryForRepoFn(memoryDir, result);
+      const memoryRefresh = shouldRefreshMemory
+        ? refreshRepoMemoryFn(repo.repoPath, memoryDir, logger)
+        : {
+            status: "skipped",
+            refreshed: false,
+            skipped: true,
+            reason: "no_synced_thread_change",
+          };
       const entry = {
         repo: repo.repoPath,
         repo_slug: repo.repoSlug,
-        status: "pulled",
+        status: syncedThreadsChanged ? "pulled" : "unchanged",
         downloaded_objects: result.downloaded_objects || 0,
+        synced_threads_changed: syncedThreadsChanged,
         recovery_uploaded_objects: recoveryResult?.objects_uploaded || 0,
         current_thread: result.current_thread || null,
         imported_thread: result.imported_thread?.thread_id || null,
+        memory_status: memoryRefresh.status,
+        memory_refreshed: memoryRefresh.refreshed,
+        memory_reason: memoryRefresh.reason || null,
+        sync_case: summarizeRepoSyncCase({
+          status: syncedThreadsChanged ? "pulled" : "unchanged",
+          syncedThreadsChanged,
+          memoryRefresh,
+          recoveryResult,
+          result,
+        }),
+        memory_case: summarizeMemoryCase(memoryRefresh),
+        thread_case: summarizeThreadCase(result),
       };
+      if (memoryRefresh.error) {
+        entry.memory_error = memoryRefresh.error;
+      }
+      if (syncedThreadsChanged) {
+        changedRepoCount += 1;
+      } else {
+        unchangedRepoCount += 1;
+      }
+      if (memoryRefresh.refreshed) {
+        refreshedMemoryRepoCount += 1;
+      } else {
+        skippedMemoryRepoCount += 1;
+      }
       syncedRepos.push(entry);
-      recordManagedRepoEvent(configDir, "startup_sync_repo", entry, [repo.repoPath]);
+      recordManagedRepoEvent(configDir, `${reason}_sync_repo`, entry, [repo.repoPath]);
     } catch (error) {
-      logger.write(`startup sync error ${repo.repoPath}: ${error.message}`);
+      logger.write(`${reason} sync error ${repo.repoPath}: ${error.message}`);
       const entry = {
         repo: repo.repoPath,
         repo_slug: repo.repoSlug,
@@ -327,21 +520,43 @@ async function runStartupSync(configDir, codexHome, logger) {
         error: error.message,
       };
       errors.push(entry);
-      recordManagedRepoEvent(configDir, "startup_sync_repo", entry, [repo.repoPath]);
+      recordManagedRepoEvent(configDir, `${reason}_sync_repo`, entry, [repo.repoPath]);
     }
   }
 
   const completedAt = new Date().toISOString();
-  recordManagedRepoEvent(configDir, "startup_sync_completed", {
+  const completionEntry = {
     completed_at: completedAt,
     managed_repo_count: managedRepos.length,
-    synced_repo_count: syncedRepos.length,
+    processed_repo_count: syncedRepos.length,
+    synced_repo_count: changedRepoCount,
+    changed_repo_count: changedRepoCount,
+    unchanged_repo_count: unchangedRepoCount,
     skipped_repo_count: skippedRepoCount,
+    refreshed_memory_repo_count: refreshedMemoryRepoCount,
+    skipped_memory_repo_count: skippedMemoryRepoCount,
     error_count: errors.length,
-  });
+    completion_case: summarizeCompletionCase({
+      changedRepoCount,
+      unchangedRepoCount,
+      skippedRepoCount,
+      errorCount: errors.length,
+    }),
+    memory_case: summarizeCompletionMemoryCase({
+      refreshedMemoryRepoCount,
+      skippedMemoryRepoCount,
+      errorCount: errors.length,
+    }),
+  };
+  recordManagedRepoEvent(configDir, `${reason}_sync_completed`, completionEntry);
   return {
-    synced_repo_count: syncedRepos.length,
+    processed_repo_count: syncedRepos.length,
+    synced_repo_count: changedRepoCount,
+    changed_repo_count: changedRepoCount,
+    unchanged_repo_count: unchangedRepoCount,
     skipped_repo_count: skippedRepoCount,
+    refreshed_memory_repo_count: refreshedMemoryRepoCount,
+    skipped_memory_repo_count: skippedMemoryRepoCount,
     synced_repos: syncedRepos,
     errors,
     completed_at: completedAt,
@@ -405,13 +620,35 @@ function serializeEventValue(value) {
   return JSON.stringify(value);
 }
 
-main().catch((error) => {
-  const configDir = resolveConfigDir();
-  const logger = createLogger(configDir);
-  logger.write(`fatal: ${error.stack || error.message}`);
-  writeState(configDir, {
-    phase: "error",
-    last_error: error.message,
+if (require.main === module) {
+  main().catch((error) => {
+    const configDir = resolveConfigDir();
+    const logger = createLogger(configDir);
+    logger.write(`fatal: ${error.stack || error.message}`);
+    writeState(configDir, {
+      phase: "error",
+      last_error: error.message,
+    });
+    process.exit(1);
   });
-  process.exit(1);
-});
+}
+
+module.exports = {
+  createLogger,
+  main,
+  parseArgs,
+  recordManagedRepoEvent,
+  refreshRepoMemory,
+  repoStateMetadataChanged,
+  runBackgroundRepoMetadataRefresh,
+  runShutdownSync,
+  runStartupSync,
+  serializeEventValue,
+  shouldRefreshRepoMemoryFromPull,
+  summarizeCompletionCase,
+  summarizeCompletionMemoryCase,
+  summarizeMemoryCase,
+  summarizeRepoSyncCase,
+  summarizeThreadCase,
+  writeState,
+};

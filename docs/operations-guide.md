@@ -105,6 +105,10 @@ the selected thread bundles under `threads/`.
 - `.codex-handoff/memory.md`
 - `.codex-handoff/memory-state.json`
 
+`memory.md` is an append-oriented derived artifact: it keeps a basic repo
+summary near the top and appends newer conversation summaries as timestamped
+updates when synced thread activity changes.
+
 ### Global runtime files
 
 - `~/.codex-handoff/config.json`

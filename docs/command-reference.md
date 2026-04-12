@@ -89,6 +89,10 @@ By default this passes a compact deterministic `thread-digest.json` into the
 isolated summarizer and does not copy full thread bundles. Use
 `--max-threads <n>` only when deeper evidence is needed.
 
+Current memory behavior is append-oriented: a stable repo summary is kept near
+the top of `memory.md`, and newer conversation summaries are appended as
+timestamped update blocks instead of regenerating the whole file each time.
+
 ### `codex-handoff agent status`
 
 Inspect background agent and watcher state.

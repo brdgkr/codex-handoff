@@ -2,6 +2,7 @@ class AgentController {
   constructor({
     detectCodexProcesses,
     performStartupSync,
+    performActivationSync,
     performBackgroundRefresh,
     performShutdownSync,
     activateWatcher,
@@ -12,6 +13,7 @@ class AgentController {
   }) {
     this.detectCodexProcesses = detectCodexProcesses;
     this.performStartupSync = performStartupSync;
+    this.performActivationSync = performActivationSync || performStartupSync;
     this.performBackgroundRefresh = performBackgroundRefresh || (async () => ({ skipped: true }));
     this.performShutdownSync = performShutdownSync || (async () => ({ skipped: true }));
     this.activateWatcher = activateWatcher;
@@ -20,6 +22,7 @@ class AgentController {
     this.writeState = writeState;
     this.logger = logger || (() => {});
     this.codexRunning = false;
+    this.codexVisible = false;
     this.busy = false;
     this.watcher = null;
   }
@@ -27,11 +30,13 @@ class AgentController {
   async initialize() {
     const codexProcesses = await this.detectCodexProcesses();
     this.codexRunning = false;
+    this.codexVisible = hasVisibleCodexWindow(codexProcesses);
     await this.enterIdleState({
       phase: "idle",
       codex_processes: codexProcesses,
       watcher: this.watcher,
       codex_running: codexProcesses.length > 0,
+      codex_visible: this.codexVisible,
     });
   }
 
@@ -41,10 +46,11 @@ class AgentController {
     }
     const codexProcesses = await this.detectCodexProcesses();
     const running = codexProcesses.length > 0;
+    const visible = hasVisibleCodexWindow(codexProcesses);
     if (running && !this.codexRunning) {
       this.busy = true;
       try {
-        await this.handleCodexStart(codexProcesses);
+        await this.handleCodexStart(codexProcesses, visible);
       } finally {
         this.busy = false;
       }
@@ -59,40 +65,64 @@ class AgentController {
       }
       return;
     }
-    await this.handleSteadyState(codexProcesses, running);
+    if (running && visible && !this.codexVisible) {
+      this.busy = true;
+      try {
+        await this.handleCodexActivate(codexProcesses);
+      } finally {
+        this.busy = false;
+      }
+      return;
+    }
+    if (running && !visible && this.codexVisible) {
+      this.busy = true;
+      try {
+        await this.handleCodexHidden(codexProcesses);
+      } finally {
+        this.busy = false;
+      }
+      return;
+    }
+    await this.handleSteadyState(codexProcesses, running, visible);
   }
 
-  async handleCodexStart(codexProcesses) {
+  async handleCodexStart(codexProcesses, visible = hasVisibleCodexWindow(codexProcesses)) {
     this.logger(`Codex detected (${codexProcesses.length} process(es))`);
     await this.recordEvent("codex_detected", { process_count: codexProcesses.length });
     this.codexRunning = true;
+    this.codexVisible = visible;
     await this.enterSyncingState({
       phase: "syncing",
       codex_processes: codexProcesses,
       watcher: this.watcher,
       codex_running: true,
+      codex_visible: visible,
     });
     this.logger("starting initial sync");
     const syncResult = await this.performStartupSync();
     this.logger("initial sync finished");
     const codexProcessesAfterSync = await this.detectCodexProcesses();
     if (codexProcessesAfterSync.length > 0) {
+      this.codexVisible = settleVisibleAfterSync(codexProcessesAfterSync, this.codexVisible);
       this.watcher = await this.startWatching();
       await this.enterWatchingState({
         phase: "watching",
         codex_processes: codexProcessesAfterSync,
         watcher: this.watcher,
         codex_running: true,
+        codex_visible: this.codexVisible,
         last_sync: syncResult,
       });
       return;
     }
     this.codexRunning = false;
+    this.codexVisible = false;
     await this.enterIdleState({
       phase: "idle",
       codex_processes: [],
       watcher: this.watcher,
       codex_running: false,
+      codex_visible: false,
       last_sync: syncResult,
     });
   }
@@ -110,6 +140,7 @@ class AgentController {
       codex_processes: [],
       watcher: null,
       codex_running: false,
+      codex_visible: false,
     });
     try {
       this.logger("starting shutdown sync");
@@ -125,22 +156,95 @@ class AgentController {
       await this.recordEvent("shutdown_sync_error", { error: error.message });
     }
     this.codexRunning = false;
+    this.codexVisible = false;
     await this.enterIdleState({
       phase: "idle",
       codex_processes: [],
       watcher: null,
       codex_running: false,
+      codex_visible: false,
       last_shutdown_sync: shutdownSync,
     });
   }
 
-  async handleSteadyState(codexProcesses, running) {
+  async handleCodexActivate(codexProcesses) {
+    this.logger(`Codex activated (${codexProcesses.length} process(es))`);
+    await this.recordEvent("codex_activated", { process_count: codexProcesses.length });
+    this.codexVisible = true;
+    await this.enterSyncingState({
+      phase: "resyncing",
+      codex_processes: codexProcesses,
+      watcher: this.watcher,
+      codex_running: true,
+      codex_visible: true,
+    });
+    this.logger("starting activation sync");
+    const syncResult = await this.performActivationSync();
+    this.logger("activation sync finished");
+    const codexProcessesAfterSync = await this.detectCodexProcesses();
+    if (codexProcessesAfterSync.length === 0) {
+      if (this.watcher) {
+        await this.stopWatching();
+        this.watcher = null;
+      }
+      this.codexRunning = false;
+      this.codexVisible = false;
+      await this.enterIdleState({
+        phase: "idle",
+        codex_processes: [],
+        watcher: null,
+        codex_running: false,
+        codex_visible: false,
+        last_activation_sync: syncResult,
+      });
+      return;
+    }
+    this.codexVisible = settleVisibleAfterSync(codexProcessesAfterSync, this.codexVisible);
+    if (!this.watcher) {
+      this.watcher = await this.startWatching();
+    }
+    await this.enterWatchingState({
+      phase: "watching",
+      codex_processes: codexProcessesAfterSync,
+      watcher: this.watcher,
+      codex_running: true,
+      codex_visible: this.codexVisible,
+      last_activation_sync: syncResult,
+    });
+  }
+
+  async handleCodexHidden(codexProcesses) {
+    this.logger("Codex hidden while process remains running");
+    await this.recordEvent("codex_hidden", { process_count: codexProcesses.length });
+    this.codexVisible = false;
+    if (this.watcher) {
+      await this.enterWatchingState({
+        phase: "watching",
+        codex_processes: codexProcesses,
+        watcher: this.watcher,
+        codex_running: true,
+        codex_visible: false,
+      });
+      return;
+    }
+    await this.enterIdleState({
+      phase: "idle",
+      codex_processes: codexProcesses,
+      watcher: null,
+      codex_running: true,
+      codex_visible: false,
+    });
+  }
+
+  async handleSteadyState(codexProcesses, running, visible = hasVisibleCodexWindow(codexProcesses)) {
+    this.codexVisible = visible;
     if (running && this.watcher) {
       await this.enterWatchingState({
         phase: "watching",
         codex_processes: codexProcesses,
         watcher: this.watcher,
         codex_running: true,
+        codex_visible: visible,
       });
       await this.performBackgroundRefresh();
       return;
@@ -150,6 +254,7 @@ class AgentController {
       codex_processes: codexProcesses,
       watcher: this.watcher,
       codex_running: running,
+      codex_visible: visible,
     });
     await this.performBackgroundRefresh();
   }
@@ -175,6 +280,30 @@ class AgentController {
   }
 }
 
+function hasVisibleCodexWindow(codexProcesses) {
+  const processes = Array.isArray(codexProcesses) ? codexProcesses : [];
+  if (processes.length === 0) {
+    return false;
+  }
+  if (processes.some((item) => item?.hasVisibleWindow === true)) {
+    return true;
+  }
+  if (processes.every((item) => item?.hasVisibleWindow === false)) {
+    return false;
+  }
+  return true;
+}
+
+function settleVisibleAfterSync(codexProcesses, previousVisible) {
+  const visible = hasVisibleCodexWindow(codexProcesses);
+  if (!visible && previousVisible) {
+    return true;
+  }
+  return visible;
+}
+
 module.exports = {
   AgentController,
+  hasVisibleCodexWindow,
+  settleVisibleAfterSync,
 };

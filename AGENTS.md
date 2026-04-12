@@ -65,7 +65,7 @@ Before doing substantive work in this repository:
 
 This repository is attached to codex-handoff sync.
 - local project name: `codex-handoff`
-- local workspace root: `/Users/dukhyunlee/Documents/development/repos/ideook/codex-handoff`
+- local workspace root: `/Users/dukhyunlee/development/repos/ideook/codex-handoff`
 - remote auth: `global_dotenv`
 - remote auth file: `~/.codex-handoff/.env.local`
 - remote repo slug: `brdgkr-codex-handoff`
@@ -76,10 +76,10 @@ This repository is attached to codex-handoff sync.
 - installed skill path: `/Users/dukhyunlee/.codex/skills/codex-handoff`
 
 Before doing substantive work in this repository:
-0. If the local `codex-handoff` skill is installed, use it for sync, pull, import, and resume orchestration.
-1. Read `.codex-handoff/synced-threads/` first; default bootstrap reads stay inside this directory.
-2. Start with `.codex-handoff/synced-threads/current-thread.json`, then inspect the referenced bundle under `.codex-handoff/synced-threads/threads/`.
-3. If you need broader context, use `.codex-handoff/synced-threads/thread-index.json` to choose additional specific thread bundles before reading them.
+0. If the local `codex-handoff` skill is installed, use it for sync, receive, and resume orchestration.
+1. Read `.codex-handoff/memory.md` first when it exists; it is the compact repo-level summary.
+2. If you need detailed context, read `.codex-handoff/synced-threads/current-thread.json`, then inspect the referenced bundle under `.codex-handoff/synced-threads/threads/`.
+3. If you need broader context beyond the current thread, use `.codex-handoff/synced-threads/thread-index.json` to choose additional specific thread bundles before reading them.
 4. If the user asks to continue previous work, run `codex-handoff --repo . resume --goal "<user-goal>"`.
 5. Never enumerate or bulk-read `.codex-handoff/synced-threads/threads/**` or raw session jsonl files. Only inspect the specific bundle(s) selected from `current-thread.json`, `thread-index.json`, or an explicit user request.
 <!-- codex-handoff:end -->

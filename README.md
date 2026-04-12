@@ -103,7 +103,9 @@ The repo-local state is intentionally simple:
   repo-local control-plane state
 - optional derived files such as `.codex-handoff/memory.md`
   manually generated repo memory artifacts that are not part of the default
-  bootstrap read path
+  bootstrap read path. The current format keeps a stable repo summary near the
+  top and appends timestamped conversation updates when new synced thread
+  activity arrives.
 
 Default restore reads stay inside `.codex-handoff/synced-threads/`. Start with
 `current-thread.json`, then use `thread-index.json` to decide which specific

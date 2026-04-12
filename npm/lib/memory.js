@@ -7,6 +7,8 @@ const { syncedThreadsDir, loadRepoState } = require("./workspace");
 
 const DEFAULT_MAX_THREAD_BYTES = 32768;
 const DEFAULT_MAX_DIGEST_THREADS = 100;
+const DEFAULT_INITIAL_UPDATE_THREADS = 3;
+const APPEND_MEMORY_SCHEMA_VERSION = "2.0";
 
 function memoryPath(memoryDir) {
   return path.join(memoryDir, "memory.md");
@@ -21,69 +23,144 @@ function summarizeMemoryWithCodex(repoPath, memoryDir, options = {}) {
   const resolvedRepoPath = path.resolve(repoPath);
   const resolvedMemoryDir = path.resolve(memoryDir);
   const resolvedInputMemoryDir = path.resolve(normalized.inputMemoryDir || syncedThreadsDir(resolvedMemoryDir));
-  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-memory-"));
-  const inputDir = path.join(tmpRoot, "input");
-  const outputDir = path.join(tmpRoot, "output");
-  const outputPath = path.join(outputDir, "memory.next.md");
-  fs.mkdirSync(inputDir, { recursive: true });
-  fs.mkdirSync(outputDir, { recursive: true });
+  const existingMemoryPath = memoryPath(resolvedMemoryDir);
+  const statePath = memoryStatePath(resolvedMemoryDir);
+  const existingMemory = fs.existsSync(existingMemoryPath) ? fs.readFileSync(existingMemoryPath, "utf8") : "";
+  const existingState = readJson(statePath, {});
+  const appendState = normalizeAppendState(existingState);
+  const threadIndex = loadThreadIndexEntries(resolvedInputMemoryDir);
+  let changedEntries = selectChangedThreadEntries(threadIndex, appendState, normalized, {
+    allowInitialEntries: !existingMemory.trim(),
+  });
+  const needsBaseSummary = !existingMemory.trim();
+  const needsLegacyTrackingInit = existingMemory.trim() && !appendState.append_mode_enabled;
+  const needsLegacyLayoutMigration = existingMemory.trim() && !looksLikeAppendMemoryDocument(existingMemory);
+  if (needsLegacyTrackingInit && !normalized.force) {
+    changedEntries = [];
+  }
+
+  if (!needsBaseSummary && !needsLegacyTrackingInit && !needsLegacyLayoutMigration && changedEntries.length === 0 && !normalized.force) {
+    return {
+      memory_path: existingMemoryPath,
+      memory_state_path: statePath,
+      dry_run: normalized.dryRun,
+      wrote_memory: false,
+      appended_update: false,
+      initialized_tracking: false,
+      summary: existingMemory,
+      state: appendState,
+      temp_dir: null,
+    };
+  }
+
+  const codexBin = resolveCodexBin(normalized.codexBin);
+  const workRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-memory-"));
+  const usedTempDirs = [];
 
   try {
-    const manifest = prepareMemoryInputs(resolvedRepoPath, resolvedMemoryDir, resolvedInputMemoryDir, inputDir, normalized);
-    const manifestPath = path.join(inputDir, "manifest.json");
-    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n", "utf8");
-    const prompt = buildMemoryPrompt({
-      goal: normalized.goal,
-      inputDir,
-      manifestPath,
-      maxWords: normalized.maxWords,
-    });
-    const codexBin = resolveCodexBin(normalized.codexBin);
-    const codexArgs = buildCodexArgs({
-      model: normalized.model,
-      outputPath,
-      reasoningEffort: normalized.reasoningEffort,
-      tmpRoot,
-    });
-    const result = spawnSync(codexBin, codexArgs, {
-      cwd: tmpRoot,
-      encoding: "utf8",
-      input: prompt,
-      killSignal: "SIGTERM",
-      maxBuffer: normalized.maxBuffer,
-      timeout: normalized.timeoutMs,
-    });
-    assertCodexResult(result, outputPath, normalized.timeoutMs);
-    const summary = fs.readFileSync(outputPath, "utf8").trimEnd() + "\n";
-    const state = {
-      schema_version: "1.0",
-      updated_at: new Date().toISOString(),
-      generator: "codex exec",
-      codex_bin: codexBin,
-    goal: normalized.goal,
-    max_digest_threads: normalized.maxDigestThreads,
-    max_words: normalized.maxWords,
-      max_threads: normalized.maxThreads,
-      max_thread_bytes: normalized.maxThreadBytes,
-      dry_run: normalized.dryRun,
-      input_manifest: manifest,
-    };
-    if (!normalized.dryRun) {
-      atomicWriteFile(memoryPath(resolvedMemoryDir), summary);
-      atomicWriteJson(memoryStatePath(resolvedMemoryDir), state);
+    let repoSummary = null;
+    let repoSummaryManifest = null;
+    if (needsBaseSummary) {
+      const repoSummaryTask = runCodexMarkdownTask({
+        codexBin,
+        keepTemp: normalized.keepTemp,
+        maxBuffer: normalized.maxBuffer,
+        maxWords: normalized.repoSummaryMaxWords,
+        model: normalized.model,
+        prepareInputs: (inputDir) => prepareMemoryInputs(resolvedRepoPath, resolvedMemoryDir, resolvedInputMemoryDir, inputDir, normalized),
+        promptBuilder: ({ inputDir, manifestPath }) => buildRepoSummaryPrompt({
+          goal: normalized.goal,
+          inputDir,
+          manifestPath,
+          maxWords: normalized.repoSummaryMaxWords,
+        }),
+        reasoningEffort: normalized.reasoningEffort,
+        timeoutMs: normalized.timeoutMs,
+        tmpRoot: path.join(workRoot, "repo-summary"),
+      });
+      repoSummary = repoSummaryTask.output.trim();
+      repoSummaryManifest = repoSummaryTask.manifest;
+      if (repoSummaryTask.temp_dir) {
+        usedTempDirs.push(repoSummaryTask.temp_dir);
+      }
     }
+
+    let appendedUpdate = null;
+    let updateManifest = null;
+    if (changedEntries.length > 0) {
+      const updateTask = runCodexMarkdownTask({
+        codexBin,
+        keepTemp: normalized.keepTemp,
+        maxBuffer: normalized.maxBuffer,
+        maxWords: normalized.updateMaxWords,
+        model: normalized.model,
+        prepareInputs: (inputDir) => prepareConversationUpdateInputs(resolvedRepoPath, resolvedMemoryDir, resolvedInputMemoryDir, inputDir, changedEntries, normalized),
+        promptBuilder: ({ inputDir, manifestPath }) => buildConversationUpdatePrompt({
+          goal: normalized.goal,
+          inputDir,
+          manifestPath,
+          maxWords: normalized.updateMaxWords,
+        }),
+        reasoningEffort: normalized.reasoningEffort,
+        timeoutMs: normalized.timeoutMs,
+        tmpRoot: path.join(workRoot, "conversation-update"),
+      });
+      appendedUpdate = renderConversationUpdateBlock(updateTask.output, changedEntries);
+      updateManifest = updateTask.manifest;
+      if (updateTask.temp_dir) {
+        usedTempDirs.push(updateTask.temp_dir);
+      }
+    }
+
+    const nextState = buildNextMemoryState({
+      appendState,
+      changedEntries,
+      trackedEntries: needsLegacyTrackingInit ? threadIndex : changedEntries,
+      dryRun: normalized.dryRun,
+      inputMemoryDir: resolvedInputMemoryDir,
+      normalized,
+      repoSummaryGenerated: needsBaseSummary,
+      repoSummaryManifest,
+      updateManifest,
+      codexBin,
+    });
+
+    const nextMemory = needsBaseSummary
+      ? renderInitialMemoryDocument(repoSummary || "", appendedUpdate)
+      : (needsLegacyTrackingInit || needsLegacyLayoutMigration)
+        ? renderInitialMemoryDocument(
+            extractLegacyRepoSummary(existingMemory),
+            mergeConversationUpdates(extractExistingConversationUpdates(existingMemory), appendedUpdate),
+          )
+        : appendConversationUpdateToMemory(existingMemory, appendedUpdate, {
+            ensureUpdatesHeader: changedEntries.length > 0,
+          });
+
+    if (!normalized.dryRun) {
+      if (needsBaseSummary || needsLegacyTrackingInit || needsLegacyLayoutMigration || appendedUpdate) {
+        if (needsBaseSummary || needsLegacyTrackingInit || needsLegacyLayoutMigration) {
+          atomicWriteFile(existingMemoryPath, nextMemory);
+        } else {
+          fs.appendFileSync(existingMemoryPath, extractAppendedPortion(existingMemory, nextMemory), "utf8");
+        }
+      }
+      atomicWriteJson(statePath, nextState);
+    }
+
     return {
-      memory_path: memoryPath(resolvedMemoryDir),
-      memory_state_path: memoryStatePath(resolvedMemoryDir),
+      memory_path: existingMemoryPath,
+      memory_state_path: statePath,
       dry_run: normalized.dryRun,
-      wrote_memory: !normalized.dryRun,
-      summary,
-      state,
-      temp_dir: normalized.keepTemp ? tmpRoot : null,
+      wrote_memory: normalized.dryRun ? false : Boolean(needsBaseSummary || needsLegacyTrackingInit || needsLegacyLayoutMigration || appendedUpdate),
+      appended_update: Boolean(appendedUpdate),
+      initialized_tracking: needsLegacyTrackingInit,
+      summary: nextMemory,
+      state: nextState,
+      temp_dir: normalized.keepTemp ? usedTempDirs[0] || workRoot : null,
     };
   } finally {
     if (!normalized.keepTemp) {
-      fs.rmSync(tmpRoot, { recursive: true, force: true });
+      fs.rmSync(workRoot, { recursive: true, force: true });
     }
   }
 }
@@ -105,11 +182,21 @@ function refreshLocalMemory(repoPath, memoryDir, options = {}) {
     ...options,
     inputMemoryDir,
   });
+  if (result.wrote_memory !== true && result.initialized_tracking !== true && result.appended_update !== true) {
+    return {
+      refreshed: false,
+      skipped: true,
+      reason: "not_needed",
+      memory_path: result.memory_path,
+      memory_state_path: result.memory_state_path,
+      input_memory_dir: inputMemoryDir,
+    };
+  }
   return {
     ...result,
     refreshed: true,
     skipped: false,
-    reason: "refreshed",
+    reason: result.initialized_tracking ? "tracking_initialized" : "refreshed",
     input_memory_dir: inputMemoryDir,
   };
 }
@@ -118,7 +205,9 @@ function normalizeOptions(options) {
   return {
     codexBin: options.codexBin || process.env.CODEX_HANDOFF_CODEX_BIN || null,
     dryRun: options.dryRun === true,
+    force: options.force === true,
     goal: options.goal || "Create a concise local repo memory summary from synced thread payloads.",
+    initialUpdateThreads: positiveIntegerOr(options.initialUpdateThreads, DEFAULT_INITIAL_UPDATE_THREADS),
     inputMemoryDir: options.inputMemoryDir || null,
     keepTemp: options.keepTemp === true,
     maxBuffer: positiveIntegerOr(options.maxBuffer, 1024 * 1024 * 16),
@@ -127,8 +216,106 @@ function normalizeOptions(options) {
     maxThreads: nonNegativeIntegerOr(options.maxThreads, 0),
     maxWords: positiveIntegerOr(options.maxWords, 900),
     model: options.model || null,
+    repoSummaryMaxWords: positiveIntegerOr(options.repoSummaryMaxWords, 140),
     reasoningEffort: options.reasoningEffort || "low",
     timeoutMs: positiveIntegerOr(options.timeoutMs, 180000),
+    updateMaxWords: positiveIntegerOr(options.updateMaxWords, 120),
+  };
+}
+
+function normalizeAppendState(state) {
+  if (state?.schema_version === APPEND_MEMORY_SCHEMA_VERSION && state?.mode === "append_log") {
+    return {
+      ...state,
+      append_mode_enabled: true,
+      processed_threads: typeof state.processed_threads === "object" && state.processed_threads ? state.processed_threads : {},
+    };
+  }
+  return {
+    schema_version: APPEND_MEMORY_SCHEMA_VERSION,
+    mode: "append_log",
+    append_mode_enabled: false,
+    processed_threads: {},
+    repo_summary_generated_at: null,
+    repo_summary_source: null,
+    updated_at: null,
+  };
+}
+
+function loadThreadIndexEntries(inputMemoryDir) {
+  const payload = readJson(path.join(inputMemoryDir, "thread-index.json"), []);
+  return Array.isArray(payload) ? [...payload].sort(compareThreadIndex) : [];
+}
+
+function threadEntryToken(entry) {
+  return [entry?.updated_at || "", entry?.bundle_path || "", entry?.thread_id || ""].join("|");
+}
+
+function selectChangedThreadEntries(threadIndex, appendState, normalized, { allowInitialEntries = false } = {}) {
+  const entries = Array.isArray(threadIndex) ? [...threadIndex].sort(compareThreadIndex) : [];
+  if (entries.length === 0) {
+    return [];
+  }
+  const changed = entries.filter((entry) => appendState.processed_threads[entry.thread_id] !== threadEntryToken(entry));
+  if (changed.length > 0) {
+    return changed.slice(0, normalized.maxDigestThreads);
+  }
+  if (normalized.force) {
+    return entries.slice(0, Math.max(1, normalized.initialUpdateThreads));
+  }
+  if (!appendState.append_mode_enabled && allowInitialEntries) {
+    return entries.slice(0, Math.max(1, normalized.initialUpdateThreads));
+  }
+  return [];
+}
+
+function buildThreadDigestFromEntries(memoryDir, entries) {
+  const selected = Array.isArray(entries) ? [...entries].sort(compareThreadIndex) : [];
+  return {
+    schema_version: "1.0",
+    generated_at: new Date().toISOString(),
+    source: "thread-index.json plus compact deterministic thread bundle digests",
+    thread_count: selected.length,
+    included_thread_count: selected.length,
+    omitted_thread_count: 0,
+    threads: selected.map((entry) => summarizeThreadEntry(memoryDir, entry)),
+  };
+}
+
+function prepareConversationUpdateInputs(repoPath, memoryDir, inputMemoryDir, inputDir, changedEntries, options) {
+  const copied = [];
+  const skipped = [];
+  const generated = [];
+  const repoState = loadRepoState(memoryDir, { repoPath });
+  const repoConfigPath = path.join(inputDir, "repo-config.json");
+  fs.writeFileSync(repoConfigPath, JSON.stringify(repoState, null, 2) + "\n", "utf8");
+  copied.push({ path: "repo-config", input_path: "repo-config.json", bytes: fs.statSync(repoConfigPath).size });
+  for (const name of ["current-thread.json", "handoff.json"]) {
+    copyMemoryFile(inputMemoryDir, name, path.join(inputDir, name), copied, skipped, { inputDir });
+  }
+  const digestPath = path.join(inputDir, "changed-thread-digest.json");
+  const digest = buildThreadDigestFromEntries(inputMemoryDir, changedEntries.slice(0, options.maxDigestThreads));
+  fs.writeFileSync(digestPath, JSON.stringify(digest, null, 2) + "\n", "utf8");
+  generated.push({
+    path: "changed-thread-digest.json",
+    bytes: fs.statSync(digestPath).size,
+    thread_count: digest.threads.length,
+  });
+  return {
+    schema_version: "2.0",
+    created_at: new Date().toISOString(),
+    repo_path: repoPath,
+    memory_dir: memoryDir,
+    input_memory_dir: inputMemoryDir,
+    input_dir: inputDir,
+    copied_files: copied,
+    generated_files: generated,
+    skipped_files: skipped,
+    changed_threads: changedEntries.map((entry) => ({
+      thread_id: entry.thread_id,
+      updated_at: entry.updated_at || null,
+      title: entry.title || entry.thread_name || entry.thread_id,
+    })),
   };
 }
 
@@ -210,23 +397,220 @@ function memoryNeedsRefresh(memoryDir, inputMemoryDir) {
     return false;
   }
   const memoryFile = memoryPath(memoryDir);
-  const stateFile = memoryStatePath(memoryDir);
-  if (!fs.existsSync(memoryFile) || !fs.existsSync(stateFile)) {
+  const state = normalizeAppendState(readJson(memoryStatePath(memoryDir), {}));
+  if (!fs.existsSync(memoryFile)) {
     return true;
   }
-  const state = readJson(stateFile, {});
-  const priorInputMemoryDir = state?.input_manifest?.input_memory_dir
-    ? path.resolve(String(state.input_manifest.input_memory_dir))
+  const existingMemory = fs.readFileSync(memoryFile, "utf8");
+  const priorInputMemoryDir = state?.input_memory_dir
+    ? path.resolve(String(state.input_memory_dir))
     : null;
+  if (!state.append_mode_enabled) {
+    return true;
+  }
+  if (!looksLikeAppendMemoryDocument(existingMemory)) {
+    return true;
+  }
   if (priorInputMemoryDir !== inputMemoryDir) {
     return true;
   }
-  const stateUpdatedAt = Date.parse(String(state.updated_at || ""));
-  if (!Number.isFinite(stateUpdatedAt)) {
-    return true;
+  const changedEntries = selectChangedThreadEntries(loadThreadIndexEntries(inputMemoryDir), state, { maxDigestThreads: DEFAULT_MAX_DIGEST_THREADS, initialUpdateThreads: DEFAULT_INITIAL_UPDATE_THREADS, force: false });
+  return changedEntries.length > 0;
+}
+
+function buildRepoSummaryPrompt({ goal, inputDir, manifestPath, maxWords }) {
+  return [
+    "You are a child Codex process invoked by codex-handoff to write a basic repo summary.",
+    "",
+    "Task:",
+    `- Return only Markdown content for a short 'Repo Summary' section under ${maxWords} words.`,
+    `- User goal: ${goal}`,
+    "- Focus on stable repository purpose and current high-level scope.",
+    "- Do not include recent work chronology, thread links, or next-step bullets.",
+    "",
+    "Input policy:",
+    `- Read only files under this isolated input directory: ${inputDir}`,
+    `- Start with this manifest: ${manifestPath}`,
+    "- Do not inspect the original repository checkout.",
+    "- Prefer repo-config.json, handoff.json, latest.md, and thread-digest.json for high-level context.",
+    "",
+    "Output requirements:",
+    "- Return only the summary body, with no heading text.",
+    "- A short paragraph or up to three bullets is acceptable.",
+  ].join("\n");
+}
+
+function buildConversationUpdatePrompt({ goal, inputDir, manifestPath, maxWords }) {
+  return [
+    "You are a child Codex process invoked by codex-handoff to append a conversation update.",
+    "",
+    "Task:",
+    `- Return only Markdown bullet lines for a concise update under ${maxWords} words.`,
+    `- User goal: ${goal}`,
+    "- Summarize only the newly changed conversation activity from changed-thread-digest.json.",
+    "- Do not restate stable repo overview unless the new conversation explicitly changed it.",
+    "- Do not include a heading; the caller will add the timestamp heading.",
+    "- End with one 'Threads:' line that lists thread_id values and turn_id when available.",
+    "",
+    "Input policy:",
+    `- Read only files under this isolated input directory: ${inputDir}`,
+    `- Start with this manifest: ${manifestPath}`,
+    "- Do not inspect the original repository checkout.",
+    "- Use changed-thread-digest.json as the primary source for the update.",
+  ].join("\n");
+}
+
+function runCodexMarkdownTask({
+  codexBin,
+  keepTemp,
+  maxBuffer,
+  model,
+  prepareInputs,
+  promptBuilder,
+  reasoningEffort,
+  timeoutMs,
+  tmpRoot,
+}) {
+  const inputDir = path.join(tmpRoot, "input");
+  const outputDir = path.join(tmpRoot, "output");
+  const outputPath = path.join(outputDir, "memory.next.md");
+  fs.mkdirSync(inputDir, { recursive: true });
+  fs.mkdirSync(outputDir, { recursive: true });
+  const manifest = prepareInputs(inputDir);
+  const manifestPath = path.join(inputDir, "manifest.json");
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n", "utf8");
+  const prompt = promptBuilder({ inputDir, manifestPath, manifest });
+  const codexArgs = buildCodexArgs({
+    model,
+    outputPath,
+    reasoningEffort,
+    tmpRoot,
+  });
+  const result = spawnSync(codexBin, codexArgs, {
+    cwd: tmpRoot,
+    encoding: "utf8",
+    input: prompt,
+    killSignal: "SIGTERM",
+    maxBuffer,
+    timeout: timeoutMs,
+  });
+  assertCodexResult(result, outputPath, timeoutMs);
+  return {
+    output: fs.readFileSync(outputPath, "utf8").trim(),
+    manifest,
+    temp_dir: keepTemp ? tmpRoot : null,
+  };
+}
+
+function renderInitialMemoryDocument(repoSummary, appendedUpdate) {
+  const parts = [
+    "# Repo Memory",
+    "",
+    "## Repo Summary",
+    repoSummary || "_Repo summary unavailable._",
+    "",
+    "## Conversation Updates",
+  ];
+  if (appendedUpdate) {
+    parts.push("", appendedUpdate.trim());
+  } else {
+    parts.push("", "_No conversation updates recorded yet._");
   }
-  const sourceNewestMtimeMs = newestSourceMtime(inputMemoryDir);
-  return sourceNewestMtimeMs > stateUpdatedAt;
+  return `${parts.join("\n").trimEnd()}\n`;
+}
+
+function looksLikeAppendMemoryDocument(existingMemory) {
+  const text = String(existingMemory || "");
+  return text.includes("# Repo Memory") && text.includes("## Repo Summary") && text.includes("## Conversation Updates");
+}
+
+function extractLegacyRepoSummary(existingMemory) {
+  const text = String(existingMemory || "").trim();
+  if (!text) {
+    return "_Repo summary unavailable._";
+  }
+  const repoOverviewMatch = text.match(/## Repo Overview\s+([\s\S]*?)(?:\n## |\s*$)/u);
+  if (repoOverviewMatch?.[1]) {
+    return repoOverviewMatch[1].trim();
+  }
+  const recentWorkMatch = text.match(/## Recent Work\s+([\s\S]*?)(?:\n## |\s*$)/u);
+  if (recentWorkMatch?.[1]) {
+    return shorten(recentWorkMatch[1].trim(), 500);
+  }
+  return shorten(text.replace(/^#+\s.*$/gmu, "").trim(), 500);
+}
+
+function extractExistingConversationUpdates(existingMemory) {
+  const text = String(existingMemory || "");
+  const match = text.match(/## Conversation Updates\s+([\s\S]*?)\s*$/u);
+  return match?.[1]?.trim() || "";
+}
+
+function mergeConversationUpdates(existingUpdates, appendedUpdate) {
+  const sections = [String(existingUpdates || "").trim(), String(appendedUpdate || "").trim()].filter(Boolean);
+  return sections.join("\n\n");
+}
+
+function appendConversationUpdateToMemory(existingMemory, appendedUpdate, { ensureUpdatesHeader = false } = {}) {
+  const base = String(existingMemory || "").trimEnd();
+  if (!ensureUpdatesHeader || !appendedUpdate) {
+    return `${base}\n`;
+  }
+  const hasUpdatesHeader = base.includes("\n## Conversation Updates");
+  const header = hasUpdatesHeader ? "" : "\n\n## Conversation Updates";
+  return `${base}${header}\n\n${appendedUpdate.trim()}\n`;
+}
+
+function extractAppendedPortion(previousContent, nextContent) {
+  return String(nextContent || "").slice(String(previousContent || "").length);
+}
+
+function renderConversationUpdateBlock(markdown, changedEntries) {
+  const heading = `### ${new Date().toISOString()}`;
+  const body = String(markdown || "").trim() || "- No new conversation summary was produced.";
+  return `${heading}\n${body}\n`;
+}
+
+function buildNextMemoryState({
+  appendState,
+  changedEntries,
+  trackedEntries,
+  dryRun,
+  inputMemoryDir,
+  normalized,
+  repoSummaryGenerated,
+  repoSummaryManifest,
+  updateManifest,
+  codexBin,
+}) {
+  const processedThreads = {
+    ...appendState.processed_threads,
+  };
+  for (const entry of trackedEntries || []) {
+    if (entry?.thread_id) {
+      processedThreads[entry.thread_id] = threadEntryToken(entry);
+    }
+  }
+  return {
+    schema_version: APPEND_MEMORY_SCHEMA_VERSION,
+    mode: "append_log",
+    updated_at: new Date().toISOString(),
+    generator: "codex exec",
+    codex_bin: codexBin,
+    goal: normalized.goal,
+    max_digest_threads: normalized.maxDigestThreads,
+    repo_summary_max_words: normalized.repoSummaryMaxWords,
+    update_max_words: normalized.updateMaxWords,
+    input_memory_dir: inputMemoryDir,
+    dry_run: dryRun,
+    repo_summary_generated_at: repoSummaryGenerated ? new Date().toISOString() : appendState.repo_summary_generated_at || null,
+    repo_summary_source: repoSummaryGenerated ? "generated_once" : (appendState.repo_summary_source || "existing_memory"),
+    last_appended_at: changedEntries.length > 0 ? new Date().toISOString() : appendState.last_appended_at || null,
+    last_appended_thread_ids: changedEntries.map((entry) => entry.thread_id).filter(Boolean),
+    processed_threads: processedThreads,
+    repo_summary_manifest: repoSummaryManifest || appendState.repo_summary_manifest || null,
+    last_update_manifest: updateManifest || null,
+  };
 }
 
 function hasMemorySourceData(inputMemoryDir) {

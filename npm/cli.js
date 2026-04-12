@@ -579,6 +579,7 @@ async function handleMemory(args, repoPath, memoryDir) {
     const result = summarizeMemoryWithCodex(repoPath, memoryDir, {
       codexBin: args.codexBin,
       dryRun: args.dryRun,
+      force: true,
       goal: args.goal || "",
       keepTemp: args.keepTemp,
       maxDigestThreads: args.maxDigestThreads,

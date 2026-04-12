@@ -626,6 +626,7 @@ async function pullRepoMemorySnapshot(repoPath, memoryDir, profile, repoState, {
     alias_remote_prefixes: targetPrefixes.filter((prefix) => prefix !== localizedRepoState.remote_prefix),
     source_remote_prefixes: pullTarget.existing_prefixes,
     downloaded_objects: downloaded.length,
+    current_thread: threadId || null,
     imported_thread: imported,
     sync_state_path: syncStatePath(memoryDir),
     sync_state: syncState,

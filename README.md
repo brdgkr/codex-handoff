@@ -22,7 +22,9 @@ command center for agentic coding." Download and learn more at
 `codex-handoff` is built for repo-scoped, one-person handoff across machines.
 It keeps pulled thread state under `.codex-handoff/synced-threads/`, keeps
 local pushable thread state under `.codex-handoff/local-threads/`, and can run
-background sync while Codex is open.
+background sync while Codex is open. It can also keep a compact repo-level
+memory file at `.codex-handoff/memory.md` so new sessions can start from a
+short summary before drilling into synced thread detail.
 
 Open the Codex app in the project you want to manage, make sure that project is
 the current workspace/cwd, and paste one of these prompts into the Codex chat.
@@ -80,6 +82,8 @@ codex-handoff setup
   state.
   Use `codex-handoff status`, `codex-handoff sync status`,
   `codex-handoff resume`, and `codex-handoff search`.
+- Update the optional repo-level memory summary.
+  Use `codex-handoff memory summarize`.
 - Stop managing the current repo without deleting its cached data.
   Use `codex-handoff detach`.
 - Remove local handoff files from `.codex-handoff/` while keeping credentials.
@@ -107,9 +111,10 @@ The repo-local state is intentionally simple:
   top and appends timestamped conversation updates when new synced thread
   activity arrives.
 
-Default restore reads stay inside `.codex-handoff/synced-threads/`. Start with
-`current-thread.json`, then use `thread-index.json` to decide which specific
-bundle under `threads/` to inspect next.
+For quick orientation, read `.codex-handoff/memory.md` first when it exists.
+For detailed restore reads, stay inside `.codex-handoff/synced-threads/`:
+start with `current-thread.json`, then use `thread-index.json` to decide which
+specific bundle under `threads/` to inspect next.
 
 ## Docs
 

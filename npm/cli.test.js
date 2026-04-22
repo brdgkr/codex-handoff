@@ -504,7 +504,7 @@ test("CLI purge-local removes local handoff data and preserves dotenv", () => {
   assert.equal(preview.applied, false);
   assert.ok(preview.removed_paths.includes(".codex-handoff/synced-threads"));
   assert.ok(preview.removed_paths.includes(".codex-handoff/local-threads"));
-  assert.ok(preview.preserved_paths.includes(".codex-handoff/.env.local"));
+  assert.ok(preview.preserved_paths.includes("~/.codex-handoff/.env.local"));
 
   const applied = JSON.parse(runCli(repoDir, "purge-local", "--apply"));
   assert.equal(applied.applied, true);
@@ -516,7 +516,7 @@ test("CLI purge-local removes local handoff data and preserves dotenv", () => {
   assert.equal(fs.existsSync(path.join(memoryDir, ".env.local")), true);
 });
 
-test("CLI remote login stores credentials in global .codex-handoff/.env.local", () => {
+test("CLI remote login stores credentials in global ~/.codex-handoff/.env.local", () => {
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-remote-login-"));
   const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-config-"));
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-handoff-home-"));

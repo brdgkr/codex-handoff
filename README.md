@@ -68,7 +68,7 @@ codex-handoff setup
 File-based auth path:
 
 ```bash
-codex-handoff remote login r2 --dotenv ./.codex-handoff/.env.local
+codex-handoff remote login r2 --dotenv ~/.codex-handoff/.env.local
 codex-handoff setup
 ```
 
@@ -103,13 +103,13 @@ The repo-local state is intentionally simple:
   `current-thread.json`, `thread-index.json`, and `threads/`
 - `.codex-handoff/local-threads/`
   local thread payloads prepared for push
-- `.codex-handoff/repo.json`
-  repo-local control-plane state
 - optional derived files such as `.codex-handoff/memory.md`
   manually generated repo memory artifacts that are not part of the default
   bootstrap read path. The current format keeps a stable repo summary near the
   top and appends timestamped conversation updates when new synced thread
   activity arrives.
+
+Machine-local config and R2 credentials live under `~/.codex-handoff/`.
 
 For quick orientation, read `.codex-handoff/memory.md` first when it exists.
 For detailed restore reads, stay inside `.codex-handoff/synced-threads/`:

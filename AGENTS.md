@@ -65,7 +65,6 @@ Before doing substantive work in this repository:
 
 This repository is attached to codex-handoff sync.
 - local project name: `codex-handoff`
-- local workspace root: `/Users/dukhyunlee/development/repos/ideook/codex-handoff`
 - remote auth: `global_dotenv`
 - remote auth file: `~/.codex-handoff/.env.local`
 - remote repo slug: `brdgkr-codex-handoff`
@@ -73,7 +72,6 @@ This repository is attached to codex-handoff sync.
 - summary mode: `auto`
 - include raw threads: `false`
 - match status: `existing_local`
-- installed skill path: `/Users/dukhyunlee/.codex/skills/codex-handoff`
 
 Before doing substantive work in this repository:
 0. If the local `codex-handoff` skill is installed, use it for sync, receive, and resume orchestration.

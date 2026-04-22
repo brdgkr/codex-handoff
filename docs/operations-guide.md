@@ -93,8 +93,6 @@ the selected thread bundles under `threads/`.
 
 ### Local repo files
 
-- `.codex-handoff/repo.json`
-- `.codex-handoff/.env.local`
 - `.codex-handoff/synced-threads/`
 - `.codex-handoff/synced-threads/current-thread.json`
 - `.codex-handoff/synced-threads/thread-index.json`
@@ -112,6 +110,7 @@ updates when synced thread activity changes.
 ### Global runtime files
 
 - `~/.codex-handoff/config.json`
+- `~/.codex-handoff/.env.local`
 - `~/.codex-handoff/runtime/agent-service.json`
 - `~/.codex-handoff/runtime/watch-service.json`
 - `~/.codex-handoff/runtime/watch-cursors.json`

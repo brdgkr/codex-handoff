@@ -29,6 +29,5 @@ pnpm-debug.log*
 .idea/
 .vscode/
 .codex-backups
-.tmp-remote-local-split-qPlPpX
-.tmp-sync-repro-CAV1P3
+.tmp-*
 .npm-cache

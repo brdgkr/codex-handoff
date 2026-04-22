@@ -127,6 +127,9 @@ test("ensureAgentsBlock points consumers to memory first and targeted synced thr
   assert.match(content, /Read `.codex-handoff\/memory\.md` first/);
   assert.match(content, /current-thread\.json/);
   assert.match(content, /thread-index\.json/);
+  assert.match(content, /remote auth file: `~\/.codex-handoff\/.env.local`/);
+  assert.doesNotMatch(content, /local workspace root/);
+  assert.doesNotMatch(content, /installed skill path/);
   assert.match(content, /Never enumerate or bulk-read `.codex-handoff\/synced-threads\/threads\/\*\*`/);
 });
 

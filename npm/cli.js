@@ -400,7 +400,6 @@ async function handlePurgeLocal(repoPath, memoryDir, configDir, _codexHome, args
     removed_count: existing.length,
     removed_paths: existing.map((item) => item.rel_path),
     preserved_paths: [
-      ".codex-handoff/.env.local",
       DEFAULT_REMOTE_AUTH_PATH,
       ".gitignore",
       "AGENTS.md",

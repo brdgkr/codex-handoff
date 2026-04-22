@@ -1,6 +1,6 @@
 {
   "name": "@brdgkr/codex-handoff",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Project handoff and cross-machine resume workflow for Codex.",
   "license": "MIT",
   "bin": {
